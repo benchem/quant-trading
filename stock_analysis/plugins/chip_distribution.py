@@ -13,8 +13,9 @@
    （假设当日成交的筹码按比例来自全体持仓），再把当日成交量按三角形
    分布（峰在近似均价 (O+C)/2）摊到 [low, high]，逐日累加。
    换手率 = 成交量/流通股本（流通股本 = float_mv/latest_price，历史近似，
-   与仪表盘筹码面板同一算法）；kline 的 turnover/amount 列若有效则优先使用。
-   固定分箱（≤200 箱，整齐步长）覆盖全窗口价格区间。
+   与仪表盘筹码面板同一算法）；turnover 有效则优先使用，amount 仅在具备
+   逐日 adj_factor 时用于 VWAP，否则回退到同复权口径的 (O+C)/2。
+   首个可见价格确定固定网格步长，随后仅随已发生行情扩展，不使用未来极值。
 
 2) 成本结构指标（逐日时间序列，回测用）:
    - 获利比例 profit_ratio: 成本 < 现价的筹码占比（市场整体盈亏状态）
@@ -66,7 +67,7 @@ from stock_analysis import AnalysisPlugin, AnalysisResult, ParamSpec
 HORIZONS = (5, 10, 20)
 #: 筹码分布预热期（前若干日分布质量不足，回测从此之后取信号/测区间）
 WARMUP = 120
-#: 分箱上限
+#: 初始价格网格密度（步长由样本首日价格确定，之后固定）
 MAX_BINS = 200
 _NICE_STEPS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10,
                20, 50, 100, 200, 500, 1000)
@@ -75,20 +76,24 @@ _NICE_STEPS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10
 # ------------------------------------------------------------------ 筹码分布
 
 
-def _bins_for(lo: float, hi: float) -> np.ndarray:
-    """[lo, hi] 的固定分箱（≤MAX_BINS 箱，步长取"整齐"数值）。"""
-    rng = hi - lo
-    if rng <= 0:
-        return np.array([lo])
-    raw = rng / MAX_BINS
-    step = next((s for s in _NICE_STEPS if s >= raw), 1000.0)
-    return np.arange(lo, hi + step / 2, step)
+def _price_step(price: float) -> float:
+    """由首个可见价格确定永久固定的网格步长，不依赖未来价格极值。"""
+    raw = max(float(price), 1e-6) / MAX_BINS
+    step = next((s for s in _NICE_STEPS if s >= raw), None)
+    if step is not None:
+        return step
+    magnitude = 10.0 ** np.floor(np.log10(raw))
+    return float(magnitude * np.ceil(raw / magnitude))
 
 
 def _tri_weights(seg: np.ndarray, lo: float, hi: float, peak: float) -> np.ndarray:
     """[lo, hi] 上以 peak 为峰的三角形分布权重（和=1）。"""
+    if not len(seg):
+        return np.array([], dtype=float)
     if hi <= lo:
-        return np.ones(len(seg))
+        w = np.zeros(len(seg))
+        w[int(np.argmin(np.abs(seg - peak)))] = 1.0
+        return w
     peak = min(max(peak, lo), hi)
     left = (seg - lo) / (peak - lo) if peak > lo else np.ones_like(seg)
     right = (hi - seg) / (hi - peak) if hi > peak else np.ones_like(seg)
@@ -99,52 +104,65 @@ def _tri_weights(seg: np.ndarray, lo: float, hi: float, peak: float) -> np.ndarr
 
 def _chip_series(low: np.ndarray, high: np.ndarray, open_: np.ndarray,
                  close: np.ndarray, vol_sh: np.ndarray,
-                 turnover: np.ndarray, amount: np.ndarray | None = None) -> dict:
+                 turnover: np.ndarray, amount: np.ndarray | None = None,
+                 adj_factor: np.ndarray | None = None) -> dict:
     """逐日换手衰减筹码分布 → 各成本指标时间序列。
 
     输入均为升序日线的 numpy 数组（价格为同一复权口径，vol_sh 单位=股，
     turnover 单位=小数，缺失为 NaN；amount 单位=元，缺失为 NaN）。
+    adj_factor 是未复权价转换为当前 OHLC 复权口径的逐日乘数；缺失时
+    amount 不参与 VWAP 估算，避免混用实际成交价与复权 OHLC。
     返回 dict of 与输入等长的数组:
     profit_ratio / avg_cost / p5 / p15 / p50 / p85 / p95 / peak / total。
     """
     n = len(close)
     t = np.where(np.isfinite(turnover), turnover, 0.01)  # 缺失回退 1%/日
     t = np.clip(t, 0.0, 1.0)
-    if amount is not None and np.isfinite(amount).any():
-        vwap = amount / np.maximum(vol_sh, 1.0)
-        vwap = np.where(np.isfinite(vwap) & (vol_sh > 0), vwap,
-                        (open_ + close) / 2.0)
-    else:
-        vwap = (open_ + close) / 2.0
+    vwap = (open_ + close) / 2.0
+    if amount is not None and adj_factor is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            adjusted_vwap = amount / np.maximum(vol_sh, 1.0) * adj_factor
+        usable = (np.isfinite(adjusted_vwap) & (adjusted_vwap > 0)
+                  & np.isfinite(adj_factor) & (adj_factor > 0) & (vol_sh > 0))
+        vwap = np.where(usable, adjusted_vwap, vwap)
 
-    lo, hi = float(low.min()) * 0.995, float(high.max()) * 1.005
-    bins = _bins_for(lo, hi)
-    m = len(bins)
-    i0_all = np.clip(np.searchsorted(bins, low) - 1, 0, m - 1)
-    i1_all = np.clip(np.searchsorted(bins, high) + 1, 0, m - 1)
-    peak = np.clip(vwap, low, high)
-    peak = np.where(np.isfinite(peak), peak, (low + high) / 2.0)
-    peak_bin = np.clip(np.searchsorted(bins, peak), 0, m - 1)
-
-    chips = np.zeros(m)
+    valid_close = close[np.isfinite(close) & (close > 0)]
+    if not len(valid_close):
+        raise ValueError("筹码分布需要至少一个有效正收盘价")
+    step = _price_step(float(valid_close[0]))
+    bins = np.zeros(1)
+    chips = np.zeros(1)
     out = {k: np.full(n, np.nan) for k in
            ("profit_ratio", "avg_cost", "p5", "p15", "p50", "p85", "p95",
             "peak", "total")}
     for i in range(n):
+        prices = (low[i], high[i], close[i], vwap[i])
+        max_price = max((float(p) for p in prices if np.isfinite(p) and p > 0),
+                        default=step)
+        required = int(np.floor(max_price / step)) + 2
+        if required > len(chips):
+            chips = np.pad(chips, (0, required - len(chips)))
+            bins = np.arange(required, dtype=float) * step
+
         if t[i] > 0:
             chips *= (1.0 - t[i])
         v = vol_sh[i]
         if np.isfinite(v) and v > 0:
-            i0, i1 = i0_all[i], i1_all[i]
-            if i1 <= i0:
-                i0 = i1 = peak_bin[i]
+            peak = vwap[i] if np.isfinite(vwap[i]) else (low[i] + high[i]) / 2.0
+            peak = min(max(peak, low[i]), high[i])
+            i0 = max(0, int(np.floor(low[i] / step)))
+            i1 = min(len(chips) - 1, int(np.ceil(high[i] / step)))
+            if i1 < i0:
+                i0 = i1 = int(np.clip(np.rint(peak / step), 0, len(chips) - 1))
             chips[i0:i1 + 1] += _tri_weights(
-                bins[i0:i1 + 1], low[i], high[i], peak[i]) * v
+                bins[i0:i1 + 1], low[i], high[i], peak) * v
         tot = chips.sum()
         if tot <= 0:
             continue
         cdf = np.cumsum(chips) / tot
-        out["profit_ratio"][i] = float(np.interp(close[i], bins, cdf))
+        # 每个价格箱的质量位于箱中心，避免现价恰在网格点时把整箱都计为获利。
+        cdf_mid = np.clip(cdf - 0.5 * chips / tot, 0.0, 1.0)
+        out["profit_ratio"][i] = float(np.interp(close[i], bins, cdf_mid))
         out["avg_cost"][i] = float((bins * chips).sum() / tot)
         for k, q in (("p5", 0.05), ("p15", 0.15), ("p50", 0.50),
                      ("p85", 0.85), ("p95", 0.95)):
@@ -298,6 +316,8 @@ class ChipDistributionPlugin(AnalysisPlugin):
         close_np = close.to_numpy()
         vol = df["volume"].astype(float).to_numpy() * 100.0  # 手 -> 股
         amount = df["amount"].astype(float).to_numpy()
+        adj_factor = (df["adj_factor"].astype(float).to_numpy()
+                      if "adj_factor" in df.columns else None)
         turnover_col = df["turnover"].astype(float).to_numpy() / 100.0
 
         # ---- 换手率: kline 列有效则用，否则 成交量/流通股本 ----
@@ -322,8 +342,8 @@ class ChipDistributionPlugin(AnalysisPlugin):
             turnover_est = True
         turnover = np.clip(np.where(np.isfinite(turnover), turnover, 0.01), 0.0, 1.0)
 
-        # ============ 1) 逐日筹码分布（vwap 峰值在 _chip_series 内按 amount 有效性选取）============
-        cs = _chip_series(low, high, open_, close_np, vol, turnover, amount)
+        # ============ 1) 逐日筹码分布（VWAP 与 OHLC 保持同一复权口径）============
+        cs = _chip_series(low, high, open_, close_np, vol, turnover, amount, adj_factor)
         pr = cs["profit_ratio"]
         avg_cost = cs["avg_cost"]
         p5, p15, p50, p85, p95 = cs["p5"], cs["p15"], cs["p50"], cs["p85"], cs["p95"]
@@ -631,7 +651,8 @@ class ChipDistributionPlugin(AnalysisPlugin):
 
         r.extra["model"] = {
             "chip_method": "换手衰减法: chips*=(1-t) 后按三角形分布摊入[low,high]"
-                           "（峰在(O+C)/2），固定≤200箱",
+                           "（VWAP 有逐日复权因子时优先，否则峰在(O+C)/2），"
+                           "首日确定固定步长并随历史行情因果扩展",
             "turnover": "kline.turnover 缺失时用 成交量/流通股本"
                         "（流通股本=float_mv/latest_price，历史近似）",
             "signals": {

@@ -6,7 +6,7 @@
 - 合成随机数据: 框架全链路运行 + JSON 可序列化
 - 确定性场景: 黑天鹅(末日暴跌)→black_swan 无回归信号但区间保留;
   温和超卖→range + 超卖信号触发; 强单边趋势→trending 无信号
-- 区间命中率标定: 高/低包络历史命中率应 ≈95%（两侧 97.5 分位标定）
+- walk-forward: 历史信号与区间标定满足前缀不变性，样本外包络命中率合理
 - 数据不足: 友好降级
 - 真实数据冒烟（data/ 存在时）
 
@@ -250,7 +250,7 @@ def t_trending_no_signal():
 
 
 def t_band_calibration():
-    """区间标定: 纯随机游走上, 次日 high/low 包络历史命中率应 ≈95%。"""
+    """因果区间标定: 纯随机游走上，样本外 high/low 包络命中率应接近 95%。"""
     df = _synth(seed=99)
     ctx = _StubCtx(df)
     r = GarchMeanReversionPlugin().run(ctx, "600001.SH")
@@ -263,6 +263,31 @@ def t_band_calibration():
     assert np.isfinite(m["lo_off"]) and m["lo_off"] > 0
     # 当日区间预测包住最新价
     assert m["range_lo"] < m["close"] < m["range_hi"]
+
+
+def t_walk_forward_prefix_invariance():
+    """追加未来行情不得改变既有历史信号、波动和区间标定。"""
+    cut, n = 450, 500
+    full = _synth(n=n, seed=31)
+    close = full["close"].to_numpy().copy()
+    close[cut:] *= np.linspace(1.0, 3.0, n - cut)
+    scale = close / full["close"].to_numpy()
+    full = _frame(close, full["high"].to_numpy() * scale,
+                  full["low"].to_numpy() * scale, full["volume"].to_numpy())
+    short_result = GarchMeanReversionPlugin().run(_StubCtx(full.iloc[:cut]), "T.SH")
+    full_result = GarchMeanReversionPlugin().run(_StubCtx(full), "T.SH")
+    assert short_result.ok and full_result.ok
+    for key in ("dev_z", "sigma", "signal", "band_lo", "band_hi"):
+        short = short_result.series[key]
+        extended = full_result.series[key]
+        future_values = dict(zip(extended["dates"], extended["values"]))
+        compared = 0
+        for date, value in zip(short["dates"], short["values"]):
+            if date not in future_values:
+                continue
+            assert future_values[date] == value, f"{key}@{date} 被未来数据改写"
+            compared += 1
+        assert compared == 200
 
 
 def t_insufficient_data():
@@ -325,6 +350,7 @@ def main() -> int:
         ("确定性: 温和超卖触发信号", t_oversold_signal),
         ("确定性: 强趋势无信号", t_trending_no_signal),
         ("区间命中率标定", t_band_calibration),
+        ("walk-forward 历史前缀不变性", t_walk_forward_prefix_invariance),
         ("数据不足友好降级", t_insufficient_data),
         ("真实数据冒烟", t_realdata_smoke),
     ]

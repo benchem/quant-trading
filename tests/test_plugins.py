@@ -153,6 +153,23 @@ def t_fundamental_paths():
         r = runner.run("fundamental_quality", "600001.SH")
         assert r.ok and r.score is not None
         assert len(r.tables["recent_periods"]) == 8
+
+        perfect = make_fundamental_frame("600001.SH", 8)
+        perfect["roe"] = 0.20
+        perfect["rev_yoy"] = 0.30
+        perfect["net_profit_yoy"] = 0.30
+        perfect["debt_ratio"] = 0.0
+        ctx.set_fundamental("600001.SH", perfect)
+        runner.clear_cache()
+        r = runner.run("fundamental_quality", "600001.SH")
+        assert r.score == 100.0 and r.verdict == "优"
+
+        roe_only = perfect.copy()
+        roe_only[["rev_yoy", "net_profit_yoy", "debt_ratio"]] = float("nan")
+        ctx.set_fundamental("600001.SH", roe_only)
+        runner.clear_cache()
+        r = runner.run("fundamental_quality", "600001.SH")
+        assert r.score == 100.0 and r.verdict == "优"
     finally:
         ctx.cleanup()
 

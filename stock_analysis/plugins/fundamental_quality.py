@@ -64,12 +64,13 @@ class FundamentalQualityPlugin(AnalysisPlugin):
         # ---- 评分（透明公式）----
         parts = []
         if roe is not None:
-            parts.append(0.4 * float(np.clip(roe / 0.20, 0, 1)) * 100)
+            parts.append((0.4, float(np.clip(roe / 0.20, 0, 1)) * 100))
         if growth_avg is not None:
-            parts.append(0.3 * float(np.clip(50 + 100 * np.tanh(growth_avg / 0.3), 0, 100)))
+            parts.append((0.3, float(np.clip(50 + 100 * np.tanh(growth_avg / 0.3), 0, 100))))
         if debt is not None:
-            parts.append(0.3 * float(np.clip(100 - debt * 120, 0, 100)))
-        score = float(np.mean(parts)) if parts else None
+            parts.append((0.3, float(np.clip(100 - debt * 120, 0, 100))))
+        score = (float(sum(w * value for w, value in parts) / sum(w for w, _ in parts))
+                 if parts else None)
 
         r.metric("roe", roe, "ROE(最新期)", 4)
         r.metric("rev_yoy", rev_yoy, "营收同比", 4)

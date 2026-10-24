@@ -1,7 +1,7 @@
 """chip_distribution 插件单测（零网络；真实数据部分自动跳过）。
 
 覆盖:
-- 筹码算法: 零换手质量守恒 / 平盘日获利比例≈0.5 / 零换手成本加权精确值
+- 筹码算法: 一字板质量守恒 / VWAP 复权 / 未来极值前缀不变性 / 成本加权
 - _zone_tests: 未触及→n=0 / 触及-收回分类正确
 - 合成随机数据（make_context, turnover 列有效路径）: 框架全链路 + JSON 可序列化
 - 确定性场景: 深跌→oversold+S1(+1); 大涨→overbought+S2(-1);
@@ -111,6 +111,41 @@ def test_conservation() -> None:
     # 半换手: total 收敛到 v/(1-(1-0.5)) = 2v
     cs3 = _chip_series(c * 0.999, c * 1.001, c, c, vol, np.full(n, 0.5))
     assert abs(cs3["total"][-1] - 2.0) < 0.05, cs3["total"][-1]
+    # 一字板 high == low：全部成交量只能进入一个价格箱，不能复制为多份筹码
+    flat = _chip_series(c, c, c, c, vol, np.full(n, 0.2))
+    expected = flat["total"][:-1] * 0.8 + 1.0
+    np.testing.assert_allclose(flat["total"][1:], expected, rtol=0, atol=1e-12)
+
+
+def test_vwap_adjustment() -> None:
+    """真实 VWAP 必须乘逐日复权因子；无因子时回退到同口径 OHLC 中点。"""
+    n = 5
+    close = np.full(n, 20.0)
+    vol = np.full(n, 1000.0)
+    amount = np.full(n, 9.8 * 1000.0)  # 未复权 VWAP=9.8，对应后复权 19.6
+    adjusted = _chip_series(close - 1.0, close + 1.0, close, close, vol,
+                            np.zeros(n), amount, np.full(n, 2.0))
+    fallback = _chip_series(close - 1.0, close + 1.0, close, close, vol,
+                            np.zeros(n), amount)
+    assert abs(adjusted["peak"][-1] - 19.6) < 0.11
+    assert abs(fallback["peak"][-1] - 20.0) < 0.11
+    assert adjusted["avg_cost"][-1] < fallback["avg_cost"][-1]
+
+
+def test_future_extreme_does_not_change_history() -> None:
+    """追加未来极端价格后，既有历史筹码指标必须保持逐点不变。"""
+    n, cut = 300, 250
+    rng = np.random.default_rng(19)
+    close = 10 * np.exp(np.cumsum(rng.normal(0, 0.01, n)))
+    close[cut:] *= np.linspace(1.0, 10.0, n - cut)
+    high = close * 1.01
+    low = close * 0.99
+    args = (low, high, close, close, np.full(n, 1000.0), np.full(n, 0.02))
+    full = _chip_series(*args)
+    prefix = _chip_series(*(a[:cut] for a in args))
+    for key in prefix:
+        np.testing.assert_allclose(full[key][:cut], prefix[key], rtol=0, atol=0,
+                                   equal_nan=True, err_msg=key)
 
 
 def test_flat_price() -> None:

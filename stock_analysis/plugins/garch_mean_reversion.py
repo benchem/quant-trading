@@ -31,8 +31,8 @@
 
 特色输出:
    - 次日 95% 预测区间 [P·e^{μ̂-1.96σ̂}, P·e^{μ̂+1.96σ̂}]（区间高低点预测）;
-   - 历史信号回测: 信号日后 5/10/20 日收益中"方向与回归方向一致"的占比
-     （= 宣称的 55%~60% 胜率的可实测版本），并附无 regime 过滤对照组。
+   - 历史信号回测: 以扩展窗口 walk-forward 生成各时点信号，统计信号日后
+     5/10/20 日收益中"方向与回归方向一致"的占比，并附无 regime 过滤对照组。
 
 防过拟合说明: ARMA/GARCH 阶数取最小充分设定（2,1）与（1,1），regime 阈值
 均用 σ 倍数表达（跨股票可比），未做网格搜索。
@@ -52,6 +52,9 @@ HORIZONS = (5, 10, 20)
 # 正式信号要求的 H 日内最小预期回归比例（1-ρ^H ≥ 该值, 即半衰期约 ≤70 日（H=5））。
 # 过滤 ρ→1 的"偏离永不回归"行情; 常规 A 股 ρ≈0.94-0.98 → rev_frac≈0.10-0.27 均通过。
 MIN_REV_FRAC = 0.05
+#: 历史评估仅在扩展窗口上定期重估，期间固定参数递推，避免逐日拟合成本。
+WF_MIN_TRAIN = 150
+WF_REFIT = 60
 
 
 # ------------------------------------------------------------------ 优化器
@@ -225,6 +228,61 @@ def _fit_garch(eps: np.ndarray) -> dict:
             "persistence": a + b, "loglik": -f_best}
 
 
+def _walk_forward_sigma(rlog: np.ndarray, p: int, q: int,
+                        min_train: int = WF_MIN_TRAIN,
+                        refit: int = WF_REFIT) -> tuple[np.ndarray, np.ndarray]:
+    """用截至各时点的数据生成条件方差和下一步波动预测。
+
+    在收益 j 发生前，仅用 rlog[:j] 重估 ARMA/GARCH；两次重估之间固定参数，
+    用新观测递推残差与方差。返回数组与 rlog 对齐，分别为收益发生时的
+    条件方差，以及该收益观测后的下一期波动预测。
+    """
+    n = len(rlog)
+    sigma2 = np.full(n, np.nan)
+    next_sigma = np.full(n, np.nan)
+    innov = np.zeros(n)
+    fit = g = None
+    last_refit = -refit
+    prev_e = 0.0
+    prev_s2 = 1e-8
+    L = max(p, q)
+
+    for j in range(n):
+        if j >= min_train and (fit is None or j - last_refit >= refit):
+            fit = _fit_arma(rlog[:j], p, q)
+            g = _fit_garch(fit["resid"][L:])
+            innov[:j] = fit["resid"]
+            prev_e = float(fit["resid"][-1])
+            prev_s2 = float(g["sigma2"][-1])
+            last_refit = j
+
+        if fit is None:
+            history = rlog[:j]
+            s2 = max(float(np.var(history)) if len(history) > 1 else 1e-8, 1e-12)
+            mu = float(np.mean(history)) if len(history) else 0.0
+            innov[j] = rlog[j] - mu
+            sigma2[j] = s2
+            next_sigma[j] = np.sqrt(s2)
+            continue
+
+        s2 = float(g["omega"] + g["alpha"] * prev_e ** 2 + g["beta"] * prev_s2)
+        mu = float(fit["c"])
+        for lag, coef in enumerate(fit["phi"], start=1):
+            if j - lag >= 0:
+                mu += coef * rlog[j - lag]
+        for lag, coef in enumerate(fit["theta"], start=1):
+            if j - lag >= 0:
+                mu += coef * innov[j - lag]
+        innov[j] = rlog[j] - mu
+        sigma2[j] = max(s2, 1e-12)
+        next_sigma[j] = np.sqrt(max(
+            g["omega"] + g["alpha"] * innov[j] ** 2 + g["beta"] * s2, 1e-12))
+        prev_e = float(innov[j])
+        prev_s2 = s2
+
+    return sigma2, next_sigma
+
+
 # ------------------------------------------------------------------ 插件
 
 
@@ -283,26 +341,18 @@ class GarchMeanReversionPlugin(AnalysisPlugin):
         e_resid = fit["resid"]
         mu1 = _arma_forecast(fit, rlog)    # 下一日条件均值
 
-        # ============ 2) GARCH 波动（对 ARMA 残差）============
+        # ============ 2) GARCH 波动（历史 walk-forward，最新预测用全量已知数据）============
         L = max(arma_p, arma_q)
         g = _fit_garch(e_resid[L:])
-        var0 = float(np.var(rlog)) or 1e-8
-        sigma2_rlog = np.full(len(rlog), var0)
-        sigma2_rlog[L:] = g["sigma2"]      # σ²_t（收益 t 发生时的条件方差）
-        sigma2 = np.empty(len(close))      # 对齐收盘: close[t] 的收益 = rlog[t-1]
-        sigma2[0] = var0
+        sigma2_rlog, next_sigma_rlog = _walk_forward_sigma(rlog, arma_p, arma_q)
+        sigma2 = np.full(len(close), np.nan)  # 对齐收盘: close[t] 的收益 = rlog[t-1]
         sigma2[1:] = sigma2_rlog
-        sigma = np.sqrt(sigma2)            # σ_t（t 日收盘时已知, 为当日收益的条件波动）
-        # 次日波动预测: σ²_{k+1} = ω + αe²_k + βσ²_k（同索引递归）
-        s_next = np.sqrt(g["omega"] + g["alpha"] * e_resid[:-1] ** 2
-                         + g["beta"] * sigma2_rlog[:-1])
-        s_next_close = np.empty(len(close))      # t 日收盘后对"次日"的 σ 预测
-        s_next_close[0] = s_next[0]
-        s_next_close[1:-1] = s_next              # day t (1..N-2): σ_{t+1} = s_next[t-1]
-        # 最后一日的真正"次日"预测（递归再进一步）
+        sigma = np.sqrt(sigma2)               # 收益发生前已可得的条件波动
+        s_next_close = np.full(len(close), np.nan)
+        s_next_close[1:] = next_sigma_rlog     # t 日收盘后对次日的 σ 预测
+        # 最新一日的次日预测使用截至当日全部数据重估，不反填历史序列。
         s1 = float(np.sqrt(g["omega"] + g["alpha"] * float(e_resid[-1]) ** 2
-                           + g["beta"] * float(sigma2_rlog[-1])))
-        s_next_close[-1] = s1
+                           + g["beta"] * float(g["sigma2"][-1])))
 
         # ============ 3) 偏离指标与 regime（历史序列, 无未来函数）============
         ln_close = np.log(close.to_numpy(dtype=float))
@@ -310,8 +360,8 @@ class GarchMeanReversionPlugin(AnalysisPlugin):
         dev = np.full(len(close), np.nan)
         dev_valid = np.isfinite(ma) & (ma > 0)
         dev[dev_valid] = ln_close[dev_valid] - np.log(ma[dev_valid])
-        # 分母加下限: 防止 σ 塌缩时 dev_z 爆炸（取下限=近250日 σ 中位数的一半）
-        sig_floor = float(np.median(sigma[-250:])) * 0.5
+        # 分母下限也逐日因果计算，不能用最后 250 日中位数反填全部历史。
+        sig_floor = pd.Series(sigma).rolling(250, min_periods=1).median().to_numpy() * 0.5
         denom = np.maximum(sigma, sig_floor) * np.sqrt(horizon)
         dz_ok = dev_valid & (denom > 0)
         dev_z = np.full(len(close), np.nan)
@@ -356,9 +406,11 @@ class GarchMeanReversionPlugin(AnalysisPlugin):
         half_life = np.log(2.0) / (-np.log(np.clip(rho_arr, 1e-9, 0.9999)))
         up_sig = (dev_z <= -z_entry)
         down_sig = (dev_z >= z_entry)
-        sig_dir = np.where(up_sig, 1.0, np.where(down_sig, -1.0, 0.0))
+        sig_dir_full = np.where(up_sig, 1.0, np.where(down_sig, -1.0, 0.0))
+        # 初始训练期仅有因果方差回退，尚未拟合 ARMA/GARCH，不计入模型胜率。
+        sig_dir_full[:WF_MIN_TRAIN + 1] = 0.0
+        sig_dir = sig_dir_full.copy()
         sig_ok = sig_dir != 0
-        sig_dir_full = sig_dir.copy()               # 全组（含任何 regime）
         # 正式信号: 震荡市 + 预期回归幅度足够（rev_frac ≥ MIN_REV_FRAC,
         # 即半衰期约 ≤70 日（H=5 时）; 过滤"偏离永不回归"的持续性行情）
         sig_dir[sig_ok & (regime != "range")] = 0.0
@@ -395,29 +447,37 @@ class GarchMeanReversionPlugin(AnalysisPlugin):
         rows_full, stats_full = _bt(sig_dir_full)
         rows_range, stats_range = _bt(sig_dir)
 
-        # ---- 区间高低点预测: 显式建模日内 high/low 偏移（σ 倍数）----
-        # 次日 close 的 95% 区间 = ±1.96σ; 次日 high/low 还需叠加日内偏移,
-        # 用历史 (high|low 相对前收) / σ 的 95 分位标定偏移倍数（稳健、无未来函数）
+        # ---- 区间高低点预测: 日内偏移按扩展窗口逐日标定 ----
+        # t 日预测 t+1 时，只能使用 t 日及以前已经实现的偏移和当时的波动预测。
         band_all_n = band_all_hit = band_rg_n = band_rg_hit = 0
-        hi_off = lo_off = float("nan")
-        if "high" in df.columns and "low" in df.columns:
-            high_np = df["high"].astype(float).to_numpy()
-            low_np = df["low"].astype(float).to_numpy()
-            d = s_next_close[:-1]                       # t→t+1 的 σ 预测
-            hi_off_s = np.log(high_np[1:] / close_np[:-1]) / d
-            lo_off_s = -np.log(low_np[1:] / close_np[:-1]) / d
-            ok = np.isfinite(hi_off_s) & np.isfinite(lo_off_s) & (d > 0)
-            # 高低点越界近似独立: 联合 95% 覆盖需每侧 ~97.5% 分位 (√0.95)
-            hi_off = float(np.nanpercentile(hi_off_s[ok], 97.5))
-            lo_off = float(np.nanpercentile(lo_off_s[ok], 97.5))
-        band_hi = close_np * np.exp(hi_off * s_next_close)
-        band_lo = close_np * np.exp(-lo_off * s_next_close)
-        if np.isfinite(hi_off) and np.isfinite(lo_off):
-            t = np.arange(60, n - 1)                     # 避开 MA 预热段
+        high_np = (df["high"].astype(float).to_numpy() if "high" in df.columns
+                   else np.full(n, np.nan))
+        low_np = (df["low"].astype(float).to_numpy() if "low" in df.columns
+                  else np.full(n, np.nan))
+        hi_off_s = np.full(n, np.nan)
+        lo_off_s = np.full(n, np.nan)
+        d = s_next_close[:-1]
+        hi_off_s[1:] = np.log(high_np[1:] / close_np[:-1]) / d
+        lo_off_s[1:] = -np.log(low_np[1:] / close_np[:-1]) / d
+        hi_off_s[:WF_MIN_TRAIN + 1] = np.nan
+        lo_off_s[:WF_MIN_TRAIN + 1] = np.nan
+        # 高低点越界近似独立: 联合 95% 覆盖需每侧约 97.5% 分位。
+        hi_off_path = pd.Series(hi_off_s).expanding(60).quantile(0.975).to_numpy()
+        lo_off_path = pd.Series(lo_off_s).expanding(60).quantile(0.975).to_numpy()
+        hi_off = float(hi_off_path[-1])
+        lo_off = float(lo_off_path[-1])
+        with np.errstate(over="ignore", invalid="ignore"):
+            band_hi = close_np * np.exp(hi_off_path * s_next_close)
+            band_lo = close_np * np.exp(-lo_off_path * s_next_close)
+        t = np.arange(max(60, WF_MIN_TRAIN), n - 1)
+        usable = (np.isfinite(band_hi[t]) & np.isfinite(band_lo[t])
+                  & np.isfinite(high_np[t + 1]) & np.isfinite(low_np[t + 1]))
+        t = t[usable]
+        if len(t):
             inside = (high_np[t + 1] <= band_hi[t]) & (low_np[t + 1] >= band_lo[t])
             band_all_n = len(t)
             band_all_hit = int(inside.sum())
-            m = (t >= 125) & (regime[t] == "range")      # 震荡市子集（regime 有定义）
+            m = regime[t] == "range"
             band_rg_n = int(m.sum())
             band_rg_hit = int(inside[m].sum())
 
@@ -581,6 +641,9 @@ class GarchMeanReversionPlugin(AnalysisPlugin):
             "arma": f"ARMA({arma_p},{arma_q}) 条件均值",
             "garch": f"GARCH(1,1): ω={g['omega']:.2e}, α={g['alpha']:.3f}, "
                      f"β={g['beta']:.3f}, 持续性={g['persistence']:.3f}",
+            "walk_forward": f"历史评估至少 {WF_MIN_TRAIN} 个收益样本，"
+                            f"每 {WF_REFIT} 日扩展窗口重估，期间固定参数递推；"
+                            "波动下限与区间偏移同样逐日因果计算",
             "dev_z": f"ln(P/MA{ma_window}) / (σ̂·√{horizon})",
             "regime_rules": {
                 "trending": f"|20日位移| ≥ {trend_sig}σ",

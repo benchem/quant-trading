@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A股数据分析仪表盘</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">📈 A股数据分析仪表盘</div>
+  <div class="meta" id="meta-line">加载中…</div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="market">市场概览</button>
+  <button class="tab" data-tab="stock">个股分析</button>
+  <button class="tab" data-tab="rank">排行榜</button>
+  <button class="tab" data-tab="trades">交易记录</button>
+</nav>
+
+<main>
+  <!-- ===================== 市场概览 ===================== -->
+  <section id="tab-market" class="panel active">
+    <div class="toolbar">
+      <span class="toolbar-label">区间</span>
+      <div class="btn-group" id="market-period">
+        <button data-days="365">1年</button>
+        <button data-days="1095">3年</button>
+        <button data-days="1825">5年</button>
+        <button data-days="3650">10年</button>
+        <button data-days="0" class="active">全部</button>
+      </div>
+    </div>
+
+    <div class="cards" id="market-cards"></div>
+
+    <div class="grid-2">
+      <div class="chart-box">
+        <div class="chart-title">主要指数对比（归一化=100，对数轴）</div>
+        <div class="chart" id="chart-indices"></div>
+      </div>
+      <div class="chart-box">
+        <div class="chart-title">市场宽度（上涨 / 下跌家数）</div>
+        <div class="chart" id="chart-breadth"></div>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="chart-box">
+        <div class="chart-title">全市场日成交额（亿元）</div>
+        <div class="chart" id="chart-amount"></div>
+      </div>
+      <div class="chart-box">
+        <div class="chart-title">等权全市场累计净值 vs 沪深300（对数轴）</div>
+        <div class="chart" id="chart-nav"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 个股分析 ===================== -->
+  <section id="tab-stock" class="panel">
+    <div class="chart-box" id="watchlist-box" style="display:none">
+      <div class="chart-title">
+        自选股（<span id="wl-count">0</span>）
+        <button id="wl-clear" class="mini-btn" title="清空全部自选">清空</button>
+      </div>
+      <div class="table-wrap" style="max-height:300px">
+        <table class="rank-table" id="wl-table">
+          <thead>
+            <tr>
+              <th>代码</th><th>名称</th>
+              <th class="num">真实价</th>
+              <th class="num">后复权价</th>
+              <th class="num">日涨跌</th>
+              <th class="num">总市值</th>
+              <th class="num" title="本地 1 分钟 K 线（新浪，真实价，后台自动同步）">分钟线</th>
+              <th class="num" title="按已登记买卖流水计算（移动加权平均成本）">持仓</th>
+              <th class="num" title="剩余持仓的移动加权平均成本 / 持仓浮动盈亏">成本 · 浮盈</th>
+              <th>最新财报</th>
+              <th class="num">营收</th>
+              <th class="num">营收同比</th>
+              <th class="num">净利润</th>
+              <th class="num">净利同比</th>
+              <th class="num">ROE</th>
+              <th class="num">操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="wl-news" style="display:none">
+        <div class="chart-title" style="margin-top:12px">
+          <span id="wl-news-title">最新消息</span>
+          <button id="wl-news-refresh" class="mini-btn" style="margin-left:0" title="强制重新抓取（绕过 30 分钟缓存）">刷新</button>
+          <span class="hint" id="wl-news-hint" style="margin:0"></span>
+        </div>
+        <div id="wl-news-list"></div>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <div class="search-box">
+        <input id="stock-search" type="text" placeholder="搜索代码或名称，如 600519 / 茅台" autocomplete="off">
+        <div class="search-suggest" id="search-suggest"></div>
+      </div>
+      <div class="chips" id="stock-chips"></div>
+    </div>
+
+    <div class="toolbar" id="stock-toolbar" style="display:none">
+      <div class="stock-head" id="stock-head"></div>
+      <span class="toolbar-label">统计区间</span>
+      <div class="btn-group" id="stock-period">
+        <button data-days="31">1月</button>
+        <button data-days="92">3月</button>
+        <button data-days="183">6月</button>
+        <button data-days="365" class="active">1年</button>
+        <button data-days="1095">3年</button>
+        <button data-days="0">全部</button>
+      </div>
+    </div>
+
+    <div class="cards" id="stock-cards"></div>
+
+    <div class="chart-box">
+      <div class="chart-title">
+        日K线（前复权 · 最新价=真实价）· 均线 · 成交量 · <span style="color:var(--up)">▲买</span> / <span style="color:var(--down)">▼卖</span>
+        <span style="color:var(--accent)" title="点击任意一根日K线，查看该日 1 分钟分时（需本地分钟数据，自选股自动同步）">🖱 点K线看当日分时</span>
+        <span id="trade-summary" class="trade-summary"></span>
+        <button id="trade-btn" class="mini-btn trade-btn" title="到「交易记录」页登记 / 编辑 / 删除买卖（展示在 K 线上）">管理交易 →</button>
+      </div>
+
+      <div class="chart chart-kline" id="chart-kline"></div>
+
+      <div class="table-wrap" id="trade-table-wrap" style="display:none;max-height:280px">
+        <table class="rank-table" id="trade-table">
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>方向</th>
+              <th class="num">价格</th>
+              <th class="num">股数</th>
+              <th class="num">金额</th>
+              <th>备注</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="subtabs" id="stock-subtabs">
+      <button class="subtab active" data-sub="cmp">走势对比</button>
+      <button class="subtab" data-sub="mf">多因子突破</button>
+      <button class="subtab" data-sub="gm">GARCH 回归</button>
+      <button class="subtab" data-sub="cd">筹码分布</button>
+      <button class="subtab" data-sub="bb">布林通道</button>
+      <button class="subtab" data-sub="fund">财报</button>
+    </div>
+
+    <div class="subpanel active" data-subpanel="cmp">
+      <div class="chart-box">
+        <div class="chart-title">
+          走势对比（归一化=100）
+          <select id="cmp-index" class="select">
+            <option value="000300.SH">vs 沪深300</option>
+            <option value="000001.SH">vs 上证指数</option>
+            <option value="399001.SZ">vs 深证成指</option>
+            <option value="399006.SZ">vs 创业板指</option>
+            <option value="000905.SH">vs 中证500</option>
+            <option value="000852.SH">vs 中证1000</option>
+          </select>
+        </div>
+        <div class="chart" id="chart-cmp"></div>
+      </div>
+    </div>
+
+    <div class="subpanel" data-subpanel="mf">
+      <div class="chart-box">
+        <div class="chart-title">
+          多因子复合突破（VAM 动量 × VPD 量价 × 量比 × 波动压缩 · 四因子共振 + 三道硬门过滤 · 数据窗口最近 250 日，随统计区间缩放）
+          <span id="mf-status" class="hint"></span>
+        </div>
+        <div class="cards" id="mf-cards"></div>
+        <div class="mf-banner" id="mf-banner" style="display:none"></div>
+        <div class="mf-gates" id="mf-gates"></div>
+        <div class="chart chart-mf" id="chart-mf"><div class="loading">加载中…</div></div>
+        <div class="table-wrap" id="mf-table-wrap" style="display:none;max-height:280px">
+          <table class="rank-table" id="mf-table">
+            <thead>
+              <tr>
+                <th>信号日</th>
+                <th class="num">收盘价</th>
+                <th class="num">量比</th>
+                <th class="num">ATR% 分位</th>
+                <th class="num">综合 z</th>
+                <th class="num" title="信号日后 5 个交易日收益">后5日</th>
+                <th class="num" title="信号日后 10 个交易日收益">后10日</th>
+                <th class="num" title="信号日后 20 个交易日收益">后20日</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="hint" id="mf-hint"></div>
+      </div>
+    </div>
+
+    <div class="subpanel" data-subpanel="gm">
+      <div class="chart-box">
+        <div class="chart-title">
+          GARCH 波动均值回归（ARMA 条件均值 × GARCH 波动聚集 · 超卖/超买回归 + 区间高低点预测 · 数据窗口最近 250 日，随统计区间缩放）
+          <span id="gm-status" class="hint"></span>
+        </div>
+        <div class="cards" id="gm-cards"></div>
+        <div class="mf-banner" id="gm-banner" style="display:none"></div>
+        <div class="mf-gates" id="gm-gates"></div>
+        <div class="chart chart-gm" id="chart-gm"><div class="loading">加载中…</div></div>
+        <div class="table-wrap" id="gm-table-wrap" style="display:none;max-height:280px">
+          <table class="rank-table" id="gm-table">
+            <thead>
+              <tr>
+                <th>信号日</th>
+                <th>方向</th>
+                <th class="num">收盘价</th>
+                <th class="num">dev_z</th>
+                <th class="num" title="信号日后 5 个交易日收益">后5日</th>
+                <th class="num" title="信号日后 10 个交易日收益">后10日</th>
+                <th class="num" title="信号日后 20 个交易日收益">后20日</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="hint" id="gm-hint"></div>
+      </div>
+    </div>
+
+    <div class="subpanel" data-subpanel="cd">
+      <div class="chart-box">
+        <div class="chart-title">
+          筹码分布与成本均线（换手衰减筹码结构 · 获利比例/成本均线/集中度 · 支撑阻力双口径回测 · 数据窗口最近 250 日，随统计区间缩放）
+          <span id="cd-status" class="hint"></span>
+        </div>
+        <div class="cards" id="cd-cards"></div>
+        <div class="mf-banner" id="cd-banner" style="display:none"></div>
+        <div class="mf-gates" id="cd-gates"></div>
+        <div class="chart chart-cd" id="chart-cd-1"><div class="loading">加载中…</div></div>
+        <div class="chart chart-cd" id="chart-cd-2"><div class="loading">加载中…</div></div>
+        <div class="chart chart-cd" id="chart-cd-3"><div class="loading">加载中…</div></div>
+        <div class="table-wrap" id="cd-table-wrap" style="display:none;max-height:280px">
+          <table class="rank-table" id="cd-table">
+            <thead>
+              <tr>
+                <th>信号日</th>
+                <th>类型</th>
+                <th class="num">收盘价</th>
+                <th class="num">获利比例</th>
+                <th class="num" title="信号日后 5 个交易日收益">后5日</th>
+                <th class="num" title="信号日后 10 个交易日收益">后10日</th>
+                <th class="num" title="信号日后 20 个交易日收益">后20日</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="hint" id="cd-hint"></div>
+      </div>
+
+      <div class="chart-box">
+        <div class="chart-title">筹码分布（成本分布 · 真实价单位 · 换手衰减法）</div>
+        <div class="cards" id="chip-cards"></div>
+        <div class="chart chart-chips" id="chart-chips"><div class="loading">加载中…</div></div>
+        <div class="hint" id="chip-hint"></div>
+      </div>
+    </div>
+
+    <div class="subpanel" data-subpanel="bb">
+      <div class="chart-box">
+        <div class="chart-title">
+          布林带通道与相对位置（MA20 ± 2σ 通道 · %b 因子 · 挤压突破 · 贴轨 regime 防提前离场 · 数据窗口最近 250 日，随统计区间缩放）
+          <span id="bb-status" class="hint"></span>
+        </div>
+        <div class="cards" id="bb-cards"></div>
+        <div class="mf-banner" id="bb-banner" style="display:none"></div>
+        <div class="mf-gates" id="bb-gates"></div>
+        <div class="chart chart-bb" id="chart-bb-1"><div class="loading">加载中…</div></div>
+        <div class="chart chart-bb" id="chart-bb-2"><div class="loading">加载中…</div></div>
+        <div class="chart chart-bb" id="chart-bb-3"><div class="loading">加载中…</div></div>
+        <div class="table-wrap" id="bb-table-wrap" style="display:none;max-height:280px">
+          <table class="rank-table" id="bb-table">
+            <thead>
+              <tr>
+                <th>信号日</th>
+                <th>类型</th>
+                <th class="num">收盘价</th>
+                <th class="num">%b</th>
+                <th class="num" title="信号日后 5 个交易日收益">后5日</th>
+                <th class="num" title="信号日后 10 个交易日收益">后10日</th>
+                <th class="num" title="信号日后 20 个交易日收益">后20日</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="hint" id="bb-hint"></div>
+      </div>
+    </div>
+
+    <div class="subpanel" data-subpanel="fund">
+      <div class="chart-box">
+        <div class="chart-title">
+          季度 / 年报（同花顺财务摘要）
+          <div class="btn-group" id="fund-mode">
+            <button data-mode="quarter" class="active">近 8 期（季）</button>
+            <button data-mode="year">近 10 年（年）</button>
+          </div>
+        </div>
+        <div class="chart" id="chart-fund"><div class="loading">加载中…</div></div>
+        <div class="table-wrap" style="max-height:380px">
+          <table class="rank-table" id="fund-table">
+            <thead>
+              <tr>
+                <th>报告期</th>
+                <th class="num">营业总收入</th>
+                <th class="num">营收同比</th>
+                <th class="num">净利润</th>
+                <th class="num">净利同比</th>
+                <th class="num">EPS(元)</th>
+                <th class="num">ROE</th>
+                <th class="num">毛利率</th>
+                <th class="num">净利率</th>
+                <th class="num">资产负债率</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="hint" id="fund-hint">首次打开某只股票时在线抓取（约 1~2 秒），之后走本地缓存</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 排行榜 ===================== -->
+  <!-- ===================== 交易记录（自选股买卖台账 CRUD） ===================== -->
+  <section id="tab-trades" class="panel">
+    <div class="toolbar">
+      <span class="toolbar-label">范围</span>
+      <div class="btn-group" id="trades-scope">
+        <button data-scope="all" class="active">全部</button>
+        <button data-scope="watchlist">仅自选</button>
+      </div>
+      <div class="search-box">
+        <input id="trades-search" type="text" placeholder="筛选代码或名称，如 300687 / 赛意" autocomplete="off">
+      </div>
+      <span class="hint" id="trades-count" style="margin:0"></span>
+      <button id="trades-batch-btn" class="mini-btn trades-add-btn" title="粘贴多行文本批量导入历史成交">📋 批量录入</button>
+      <button id="trades-add-btn" class="mini-btn trades-add-btn" title="新增一笔交易">➕ 新增记录</button>
+    </div>
+
+    <div class="toolbar fee-cfg-bar">
+      <span class="toolbar-label" title="估算每笔交易的费用：买入=佣金+过户费；卖出=佣金+印花税+过户费">费用估算</span>
+      <label class="fee-cfg">佣金
+        <input type="number" id="fee-comm" min="0" step="0.1" style="width:52px">‱（万分之）
+      </label>
+      <label class="fee-cfg">每笔最低 <input type="number" id="fee-min" min="0" step="0.5" style="width:52px"> 元</label>
+      <span class="hint" style="margin:0">印花税 0.05%（仅卖出）· 过户费 0.001% · 与券商实际费率对齐后总费用即对账数</span>
+    </div>
+
+    <div class="chart-box" id="trades-form-box" style="display:none">
+      <div class="chart-title">
+        <span id="trades-form-title">新增交易记录</span>
+        <button id="ntf-close" class="mini-btn" style="margin-left:0" title="关闭">✕</button>
+      </div>
+      <div class="trade-form">
+        <label>股票
+          <span class="search-box" style="position:relative">
+            <input type="text" id="ntf-stock" placeholder="代码或名称，如 600519 / 茅台" autocomplete="off" style="width:210px">
+            <div class="search-suggest" id="ntf-suggest"></div>
+          </span>
+        </label>
+        <label>日期 <input type="date" id="ntf-date"></label>
+        <span class="tf-group">
+          <span class="toolbar-label">方向</span>
+          <span class="btn-group" id="ntf-side">
+            <button data-side="buy" class="active">买入</button>
+            <button data-side="sell">卖出</button>
+          </span>
+        </span>
+        <label>价格 <input type="number" id="ntf-price" min="0.01" step="0.01" placeholder="实际成交价"></label>
+        <label>股数 <input type="number" id="ntf-shares" min="1" step="100" placeholder="如 1200"></label>
+        <label>费用(元) <input type="number" id="ntf-fee" min="0" step="0.01" placeholder="留空=按费率估算" title="券商成交单上的费用（佣金+印花税+过户费）"></label>
+        <label class="tf-note">备注 <input type="text" id="ntf-note" maxlength="100" placeholder="可选，如 首仓/止盈减仓"></label>
+        <button id="ntf-save" class="tf-btn tf-save">保存</button>
+        <button id="ntf-cancel" class="tf-btn">取消</button>
+      </div>
+    </div>
+
+    <div class="chart-box" id="trades-batch-box" style="display:none">
+      <div class="chart-title">
+        <span>批量录入交易记录</span>
+        <button id="tbf-close" class="mini-btn" style="margin-left:0" title="关闭">✕</button>
+      </div>
+      <div class="trade-form">
+        <label>股票
+          <span class="search-box" style="position:relative">
+            <input type="text" id="tbf-stock" placeholder="代码或名称，如 300687 / 赛意" autocomplete="off" style="width:210px">
+            <div class="search-suggest" id="tbf-suggest"></div>
+          </span>
+        </label>
+        <button id="tbf-parse" class="tf-btn">解析</button>
+      </div>
+      <div class="batch-hint">
+        每行一笔，列之间用 <b>空格 / 逗号 / Tab</b> 分隔：
+        <b>日期 方向 价格 股数 [费用] [备注]</b><br>
+        方向：买/卖（或 buy/sell、B/S）；日期支持 <code>2025-03-05</code> / <code>2025/3/5</code> /
+        <code>2025.03.05</code>；费用列可留空（按上方费率估算）；以 <code>#</code> 开头的行与空行忽略；
+        首行表头（含"日期/方向/价格"等字样）自动跳过。
+      </div>
+      <textarea id="tbf-text" rows="10" spellcheck="false" placeholder="例如：&#10;2025-03-05 买 38.50 500&#10;2025-03-06 卖出 39.20 500 8.91 首笔止盈&#10;2025/3/7,Sell,38.80,1000&#10;2025.03.08 买 37.60 200 4.55 补仓"></textarea>
+      <div class="table-wrap batch-preview-wrap">
+        <table class="rank-table" id="tbf-preview">
+          <thead>
+            <tr>
+              <th class="num">#</th><th>日期</th><th>方向</th>
+              <th class="num">价格</th><th class="num">股数</th>
+              <th class="num">费用</th><th>备注</th><th>状态</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="batch-actions">
+        <button id="tbf-import" class="tf-btn tf-save" disabled>导入有效 0 条</button>
+        <span class="hint" id="tbf-summary" style="margin:0"></span>
+      </div>
+    </div>
+
+    <div class="chart-box">
+      <div class="chart-title">持仓汇总（成本=移动加权平均 · 摊薄=(买入+费用-卖出净额)/持仓，含费用 · 点击行跳转个股）</div>
+      <div class="table-wrap">
+        <table class="rank-table" id="trades-pos-table">
+          <thead>
+            <tr>
+              <th>代码</th><th>名称</th>
+              <th class="num">最新价</th>
+              <th class="num">笔数</th>
+              <th class="num">持仓</th>
+              <th class="num" title="移动加权平均：卖出只记已实现盈亏，不摊低剩余成本">成本价</th>
+              <th class="num" title="摊薄成本含费用：(累计买入金额+买入费用-累计卖出金额+卖出费用)/持仓，多数股票APP的口径">摊薄成本</th>
+              <th class="num">总费用</th>
+              <th class="num">已实现盈亏</th>
+              <th class="num">浮动盈亏</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="chart-box">
+      <div class="chart-title">交易流水（按时间倒序 · 费用列留空笔按费率估算）</div>
+      <div class="table-wrap" style="max-height:520px">
+        <table class="rank-table" id="trades-table">
+          <thead>
+            <tr>
+              <th>代码</th><th>名称</th>
+              <th>日期</th>
+              <th>方向</th>
+              <th class="num">价格</th>
+              <th class="num">股数</th>
+              <th class="num">金额</th>
+              <th class="num">费用</th>
+              <th>备注</th>
+              <th class="num">操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-rank" class="panel">
+    <div class="toolbar">
+      <span class="toolbar-label">区间</span>
+      <div class="btn-group" id="rank-period">
+        <button data-days="31">1月</button>
+        <button data-days="92">3月</button>
+        <button data-days="183">6月</button>
+        <button data-days="365" class="active">1年</button>
+        <button data-days="1095">3年</button>
+        <button data-days="1826">5年</button>
+      </div>
+      <span class="toolbar-label">指标</span>
+      <select id="rank-metric" class="select">
+        <option value="ret">区间涨跌幅</option>
+        <option value="vol">年化波动率</option>
+        <option value="maxdd">最大回撤</option>
+        <option value="turnover">平均换手率</option>
+      </select>
+      <select id="rank-dir" class="select">
+        <option value="0">最前（高→低）</option>
+        <option value="1">最后（低→高）</option>
+      </select>
+      <select id="rank-n" class="select">
+        <option value="20">20 只</option>
+        <option value="50" selected>50 只</option>
+        <option value="100">100 只</option>
+      </select>
+    </div>
+    <div class="table-wrap">
+      <table class="rank-table" id="rank-table">
+        <thead>
+          <tr>
+            <th>#</th><th>代码</th><th>名称</th>
+            <th class="num">区间涨跌幅</th>
+            <th class="num">年化波动</th>
+            <th class="num">最大回撤</th>
+            <th class="num">平均换手</th>
+            <th class="num">总市值</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="hint" id="rank-hint">点击表格行可跳转到个股分析</div>
+  </section>
+</main>
+
+<footer>
+  数据：本地 Parquet（后复权日线，<span id="foot-range">…</span>）· 仅供研究学习，不构成投资建议
+</footer>
+
+<div id="toast"></div>
+
+<div class="modal" id="minute-modal">
+  <div class="modal-mask" id="minute-mask"></div>
+  <div class="modal-body">
+    <div class="chart-title" style="margin-bottom:10px">
+      <b id="minute-title" style="color:var(--text);font-size:15px">分时</b>
+      <span class="hint" id="minute-sub" style="margin:0"></span>
+      <span style="flex:1"></span>
+      <button id="minute-sync" class="mini-btn" style="display:none"
+              title="从新浪在线拉取该股最近约 8 个交易日的 1 分钟 K 线（真实价，增量合并到本地）">⟳ 立即拉取</button>
+      <button id="minute-close" class="mini-btn" style="margin-left:0" title="关闭（Esc）">✕ 关闭</button>
+    </div>
+    <div class="cards" id="minute-cards"></div>
+    <div class="chart" id="chart-minute" style="height:400px"><div class="loading">加载中…</div></div>
+    <div class="hint" id="minute-hint" style="margin-top:6px"></div>
+  </div>
+</div>
+<script src="/static/echarts.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+data/
+examples/output/
+analyzer/output/
+.ipynb_checkpoints/
+.DS_Store
+watchlog/

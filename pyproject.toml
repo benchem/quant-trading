@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ashare-downloader"
+version = "0.1.0"
+description = "中国大陆A股交易数据下载器（AkShare -> 本地 Parquet）"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "tqdm>=4.60",
+    "requests>=2.28",
+    "baostock>=0.8.9",
+]
+
+[project.optional-dependencies]
+tls = ["curl_cffi>=0.7", "tls_client>=1.0"]
+plot = ["matplotlib>=3.8"]
+
+[project.scripts]
+ashare-dl = "downloader.cli:main"
+analyzer = "analyzer.__main__:main"
+stock-analysis = "stock_analysis.cli:main"
+
+[tool.setuptools]
+packages = [
+    "downloader",
+    "analyzer",
+    "stock_analysis",
+    "stock_analysis.core",
+    "stock_analysis.plugins",
+]

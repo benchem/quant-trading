@@ -2363,7 +2363,8 @@ function renderChipChart(d) {
         silent: true, symbol: "none",
         lineStyle: { color: "#e8e8e8", type: "dashed", width: 1.2 },
         label: { color: "#e8e8e8", formatter: `现价 ${d.last_close.toFixed(2)}`, position: "insideEndTop" },
-        data: [{ yAxis: rev[markIdx] }],
+        // 数值型 category 轴会把数值当作类目索引，必须使用倒序后的索引。
+        data: [{ yAxis: n - 1 - markIdx }],
       },
     }],
   });

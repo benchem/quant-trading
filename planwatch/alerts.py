@@ -15,6 +15,7 @@ class Alert:
     level: str  # info / warn / danger / target
     text: str
     sound: bool = False
+    code: str = ""  # 关联股票代码（写入统一收件箱时定位个股）
 
 
 def _load_fired() -> dict:
@@ -50,7 +51,7 @@ def evaluate(q: dict, plan: dict, book: dict, allow_t: bool = True) -> list[Aler
     def emit(key: str, level: str, text: str, cond: bool, sound: bool = False, cool: int = 10) -> None:
         if cond and _can_fire(fired, key, cond, P, day, cool):
             fired[key] = {"day": day, "fired": True, "price": P, "cool": cool}
-            out.append(Alert(key, level, text, sound))
+            out.append(Alert(key, level, text, sound, code=plan.get("code", "")))
 
     pending = set(book["pending"])
     # --- 建仓批次 ---

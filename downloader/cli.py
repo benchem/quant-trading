@@ -1,7 +1,9 @@
 """命令行入口。
 
 用法示例:
-    python -m downloader all                # 一键更新: 列表+日历+全部日线+指数
+    python -m downloader all                # 一键更新: 列表+日历+板块+全部日线+指数
+    python -m downloader board              # 刷新行业板块成分表（排行榜「板块」功能的数据）
+    python -m downloader board --with-concept  # 追加概念板块（东财题材/风格标签）
     python -m downloader stocks --codes 600519,000858
     python -m downloader stocks --start 20180101 --adjust qfq
     python -m downloader index
@@ -73,14 +75,23 @@ def build_parser() -> argparse.ArgumentParser:
     pc = sub.add_parser("calendar", help="刷新交易日历")
     _add_common(pc)
 
+    pbo = sub.add_parser(
+        "board",
+        help="刷新板块成分表（行业板块：东财行业分类，每只股票归属一个板块；--with-concept 追加概念板块）",
+    )
+    pbo.add_argument("--with-concept", action="store_true",
+                     help="同时刷新概念板块（东财题材/风格标签，成分有重叠，约多 2 分钟；东财不可用时保留旧缓存）")
+    _add_common(pbo)
+
     pb = sub.add_parser("build", help="合并全部日线 -> 单个建模数据集 parquet")
     _add_common(pb, with_range=True)
 
     pst = sub.add_parser("status", help="查看本地数据状态")
     _add_common(pst, with_range=True)
 
-    pa = sub.add_parser("all", help="一键更新: 列表+日历+全部日线+指数",
+    pa = sub.add_parser("all", help="一键更新: 列表+日历+板块+全部日线+指数",
                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    pa.add_argument("--skip-board", action="store_true", help="跳过行业板块成分表刷新")
     _add_common(pa, with_range=True, with_rotate=True)
     _add_range_opts(pa)
     pa.add_argument("--codes", default=None, help="只下载指定代码，逗号分隔，如 600519,000858")
@@ -162,6 +173,8 @@ def main(argv=None) -> None:
         dl.refresh_stock_list()
     elif args.cmd == "calendar":
         dl.refresh_trade_calendar()
+    elif args.cmd == "board":
+        dl.refresh_boards(with_concept=getattr(args, "with_concept", False))
     elif args.cmd == "stocks":
         dl.update_stocks(
             codes=args.codes, end=args.end, full=args.full, market=args.market, limit=args.limit
@@ -182,6 +195,11 @@ def main(argv=None) -> None:
             codes=args.codes, end=args.end, full=args.full, market=args.market, limit=args.limit
         )
         dl.update_indices(end=args.end, full=args.full)
+        if not args.skip_board:
+            try:
+                dl.refresh_boards()
+            except Exception as e:  # noqa: BLE001 - 板块失败不阻塞主数据
+                _log(f"行业板块刷新失败（不影响其他数据，可稍后运行 python -m downloader board 补齐）: {e}")
         _log("提示: 运行 `python -m downloader build` 生成合并建模数据集")
 
 

@@ -139,9 +139,10 @@ def _time_hooks(now: dt.datetime, plan: dict, q: dict | None, last_min: str, boo
     tm = now.strftime("%H:%M")
     if tm == last_min:
         return tm
+    code = plan.get("code", "")
     if tm in TIME_HOOKS:
         lvl, txt = TIME_HOOKS[tm]
-        emit(Alert(f"time_{tm}", lvl, txt, sound=(lvl == "warn")))
+        emit(Alert(f"time_{tm}", lvl, txt, sound=(lvl == "warn"), code=code))
     if tm == "15:01" and q and q.get("price"):
         for rule in plan.get("time_rules", []):
             if rule["date"] == now.strftime("%Y-%m-%d"):
@@ -154,9 +155,10 @@ def _time_hooks(now: dt.datetime, plan: dict, q: dict | None, last_min: str, boo
                 if _check_cond(rule["check"], close):
                     emit(Alert("checkpoint", "danger",
                                f"🔴 时间止损（{rule['date']} 收盘 {close}，{rule['check']}）：{rule['action']}",
-                               sound=True))
+                               sound=True, code=code))
                 else:
-                    emit(Alert("checkpoint", "info", f"时间止损检查通过：{now:%m-%d} 收盘 {close}（{rule['check']}）"))
+                    emit(Alert("checkpoint", "info", f"时间止损检查通过：{now:%m-%d} 收盘 {close}（{rule['check']}）",
+                               code=code))
     return tm
 
 
@@ -173,9 +175,9 @@ def _status_line(q: dict, plan: dict, book: dict) -> None:
 
 def cmd_monitor(args) -> None:
     if args.no_notify:
-        import planwatch.notify as notify
+        import notifybox
 
-        notify.DISABLE_MAC = True
+        notifybox.set_desktop_enabled(False)
     plan, book = load_plan(), load_state()
     code = plan["code"]
     p = positions(book)

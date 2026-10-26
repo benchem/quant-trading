@@ -104,6 +104,55 @@ def info(code: str, data_dir="data", period: str = "1") -> dict | None:
     }
 
 
+# A 股连续竞价时段的 60 分钟 K 线分档起点（闭区间左端点）
+HOUR_SLOTS = ("09:30", "10:30", "13:00", "14:00")
+
+
+def _hour_slot(hm: "pd.Series") -> "pd.Series":
+    """分钟数 (hour*60+minute) -> 所属 60 分钟档起点字符串。"""
+    import numpy as np
+
+    return pd.Series(
+        np.select(
+            [hm < 630, hm < 690, hm < 840],  # <10:30 / <11:30 / <14:00
+            list(HOUR_SLOTS[:3]),
+            default=HOUR_SLOTS[3],
+        ),
+        index=hm.index,
+    )
+
+
+def to_hourly(df: pd.DataFrame) -> pd.DataFrame:
+    """1 分钟 K 线 -> 60 分钟 K 线（A 股四档：09:30/10:30/13:00/14:00）。
+
+    输入列 [datetime, open, high, low, close, volume, amount]（volume 单位股），
+    输出按 (date, slot) 排序，列 [date, slot, label, open, high, low, close,
+    volume, amount]；label = "YYYY-MM-DD HH:MM"。volume 仍为股，由调用方换算单位。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=["date", "slot", "label", "open", "high", "low", "close", "volume", "amount"]
+        )
+    df = df.sort_values("datetime", kind="stable")
+    date = df["datetime"].dt.strftime("%Y-%m-%d")
+    slot = _hour_slot(df["datetime"].dt.hour * 60 + df["datetime"].dt.minute)
+    agg = (
+        pd.DataFrame({
+            "date": date, "slot": slot,
+            "open": df["open"].to_numpy(), "high": df["high"].to_numpy(),
+            "low": df["low"].to_numpy(), "close": df["close"].to_numpy(),
+            "volume": pd.to_numeric(df["volume"], errors="coerce"),
+            "amount": pd.to_numeric(df["amount"], errors="coerce"),
+        })
+        .groupby(["date", "slot"], sort=True, observed=True)
+        .agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
+             close=("close", "last"), volume=("volume", "sum"), amount=("amount", "sum"))
+        .reset_index()
+    )
+    agg["label"] = agg["date"] + " " + agg["slot"]
+    return agg
+
+
 class MinuteSyncer:
     """后台分钟线同步线程：submit() 入队即时抓取；每 refresh_every 秒自动刷新自选列表。
 

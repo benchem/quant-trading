@@ -69,7 +69,10 @@ def _items(lines: list[str], limit: int) -> list[str]:
     return items
 
 
-def _mapping_for(lines: list[str], code: str) -> list[str]:
+def _mapping_for(lines: list[str], code: str | None) -> list[str]:
+    """code=None 时不按个股过滤（整体视角，如邮件推送）。"""
+    if code is None:
+        return _items(lines, MAX_MAPPINGS)
     code = code.upper()
     selected = []
     for item in _items(lines, 50):
@@ -82,9 +85,12 @@ def _mapping_for(lines: list[str], code: str) -> list[str]:
     return selected
 
 
-def load_daily_brief(data_dir: str | Path, code: str,
+def load_daily_brief(data_dir: str | Path, code: str | None,
                      on_date: date | None = None) -> dict:
-    """读取当天简报；任何校验失败均不返回旧简报中的信号内容。"""
+    """读取当天简报；任何校验失败均不返回旧简报中的信号内容。
+
+    code=None 时不做个股映射过滤（整体推送视角）。
+    """
     day = on_date or datetime.now(LOCAL_TZ).date()
     if day.weekday() >= 5:
         return _unavailable(day, "周末")

@@ -12,3 +12,7 @@ tls_client>=1.0
 
 # 仅 examples/quick_analysis.py 需要
 matplotlib>=3.8
+
+# analyzer 分钟线/财报/新闻/估值抓取（延迟导入，缺失时对应功能降级报错）
+# 注：1.18.89+ 要求 Python>=3.11；Python 3.10 环境会取 1.18.88
+akshare>=1.18

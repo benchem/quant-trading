@@ -12,7 +12,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .auth import SESSION_COOKIE, SESSION_TTL, AuthManager
 from .datastore import DataStore, _f, _r, _UNSET
+from .notify import NotificationHub
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
@@ -81,6 +83,14 @@ class _AutoReloadRunner:
         self._refresh()
         return self._runner.list_plugins(*args, **kwargs)
 
+    def clear_cache(self):
+        """数据更新后清 Runner 结果缓存与 Context kline 缓存（由盘后调度器调用）。"""
+        with self._lock:
+            self._runner.clear_cache()
+            ctx = getattr(self._runner, "ctx", None)
+            if ctx is not None and hasattr(ctx, "clear_cache"):
+                ctx.clear_cache()
+
 
 def _safe_static(path: str) -> Path | None:
     """防目录穿越地解析静态文件路径。"""
@@ -94,9 +104,18 @@ def _safe_static(path: str) -> Path | None:
     return p if p.is_file() else None
 
 
-def make_handler(store: DataStore, runner=None, syncer=None):
+def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, updater=None,
+                 auth: AuthManager | None = None, brief_pusher=None):
     """runner: stock_analysis.core.runner.Runner（插件分析）；None 时禁用 /api/plugins*。
-    syncer: analyzer.minute.MinuteSyncer（自选股分钟线后台同步）；None 时禁用。"""
+    syncer: analyzer.minute.MinuteSyncer（自选股分钟线后台同步）；None 时禁用。
+    notifier: 消息中心——多用户模式传 NotificationHub（按用户隔离收件箱），
+        共享单用户模式传单个 NotificationCenter；None 时禁用 /api/notifications。
+    updater: analyzer.updates.EodUpdater（盘后自动更新调度器）；None 时禁用 /api/update/*。
+    brief_pusher: analyzer.overseas_push.OverseasBriefPusher（美股简报邮件推送）；
+        None 时禁用 /api/us_brief_push。
+    auth: AuthManager；None 为「共享」单用户模式（免登录，数据存根级文件），
+        否则所有业务 API 需登录（自选/交易/站内信按用户隔离）。"""
+    hub = isinstance(notifier, NotificationHub)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ashare-analyzer/1.0"
@@ -113,6 +132,9 @@ def make_handler(store: DataStore, runner=None, syncer=None):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if getattr(self, "_pending_cookie", None):
+                self.send_header("Set-Cookie", self._pending_cookie)
+                self._pending_cookie = None
             for k, v in (extra or {}).items():
                 self.send_header(k, v)
             self.end_headers()
@@ -129,15 +151,113 @@ def make_handler(store: DataStore, runner=None, syncer=None):
             q = parsed.query
             return {k: v[-1] for k, v in parse_qs(q, encoding="utf-8").items()}
 
+        # --------------------------------------------------------- 鉴权
+
+        def _current_user(self) -> str | None:
+            """当前请求的用户；共享模式恒为 None（= 共享桶）；认证模式下未登录为 None。"""
+            if auth is None:
+                return None
+            m = re.search(rf"(?:^|;\s*){SESSION_COOKIE}=([^;]+)", self.headers.get("Cookie", ""))
+            if not m:
+                return None
+            return auth.user_of_token(m.group(1))
+
+        def _require_user(self) -> str | None:
+            """业务 API 鉴权：未登录时回 401 并返回 None（调用方直接 return）。"""
+            user = self._current_user()
+            if user is None:
+                self._json({"error": "未登录", "auth": True}, 401)
+                return None
+            return user
+
+        def _set_session(self, token: str) -> None:
+            self._pending_cookie = (
+                f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}"
+            )
+
+        def _clear_session(self) -> None:
+            self._pending_cookie = f"{SESSION_COOKIE}=; Path=/; Max-Age=0"
+
+        def _inbox(self, user: str):
+            """当前用户的收件箱对象（hub 模式按用户隔离；共享模式为同一收件箱）。"""
+            if notifier is None:
+                return None
+            return notifier.center(user) if hub else notifier
+
+        # ------------------------------------------------------------ 认证 API
+
+        def _api_auth_status(self):
+            """公开端点：当前登录状态（前端据此决定显示登录框还是仪表盘）。"""
+            if auth is None:
+                self._json({"auth": False, "user": None, "n_users": 0})
+                return
+            self._json({
+                "auth": True,
+                "user": self._current_user(),
+                "n_users": len(auth.users()),
+            })
+
+        def _post_auth_register(self, req: dict):
+            if auth is None:
+                return self._json({"error": "当前为免登录共享模式，无需注册"}, 400)
+            name = str(req.get("username") or "").strip()
+            password = req.get("password")
+            try:
+                first = not auth.users()
+                info = auth.create_user(name, password)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            # 首个注册用户：把升级前的 legacy 数据（自选/交易/站内信）迁入其名下
+            if first:
+                moved = store.migrate_legacy_to(info["name"])
+                if moved:
+                    print(f"已将 legacy 数据迁入用户 {info['name']}: {', '.join(moved)}")
+            token = auth.login(name, password)
+            self._set_session(token)
+            # first=True 表示本次注册即首个用户（其 legacy 数据已完成迁移）
+            self._json({"ok": True, "user": info["name"], "first": first})
+
+        def _post_auth_login(self, req: dict):
+            if auth is None:
+                return self._json({"error": "当前为免登录共享模式，无需登录"}, 400)
+            name = str(req.get("username") or "").strip()
+            token = auth.login(name, req.get("password") or "")
+            if token is None:
+                return self._json({"error": "用户名或密码错误"}, 401)
+            self._set_session(token)
+            self._json({"ok": True, "user": name})
+
+        def _post_auth_password(self):
+            user = self._require_user()
+            if user is None:
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b"{}"
+                req = json.loads(body.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                return self._json({"error": "请求体应为 JSON"}, 400)
+            old = req.get("old_password") or ""
+            new = req.get("new_password")
+            if not auth.verify(user, old):
+                return self._json({"error": "原密码错误"}, 400)
+            try:
+                auth.change_password(user, new)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            self._json({"ok": True})
+
         # ---------------------------------------------------------------- API
 
-        def _api(self, path: str, params: dict):
+        def _api(self, path: str, params: dict, user: str | None = None):
+            """业务 GET API。user：当前用户（共享模式为 None=共享桶；
+            调用前 do_GET 已完成鉴权，认证模式下不会为 None）。"""
             try:
                 if path == "/api/meta":
                     self._json(store.meta)
                 elif path == "/api/watchlist":
                     self._json({
-                        "codes": store.watchlist(),
+                        "codes": store.watchlist(user),
                         "syncing": syncer.pending() if syncer else [],
                     })
                 elif path == "/api/stocks":
@@ -163,8 +283,39 @@ def make_handler(store: DataStore, runner=None, syncer=None):
                             params.get("metric", "ret"),
                             int(params.get("n", 30)),
                             params.get("asc", "0") == "1",
+                            board=(params.get("board") or None),
+                            market=(params.get("market") or None),
                         )
                     )
+                elif path == "/api/boards":
+                    btype = params.get("type", "industry")
+                    self._json(
+                        {
+                            "type": btype,
+                            "available": store._board_members_of(btype) is not None,
+                            "industry_available": store.board_df is not None,
+                            "concept_available": bool(
+                                store.board_all_df is not None
+                                and (store.board_all_df["board_type"] == "concept").any()
+                            ),
+                            "boards": store.boards(btype),
+                        }
+                    )
+                elif path == "/api/board_rank":
+                    start, end = params.get("start"), params.get("end")
+                    if not start or not end:
+                        return self._json({"error": "需要 start/end 参数"}, 400)
+                    out = store.board_rank(
+                        start,
+                        end,
+                        params.get("metric", "ret"),
+                        int(params.get("n", 30)),
+                        params.get("asc", "0") == "1",
+                        board_type=params.get("type", "industry"),
+                    )
+                    if out.get("error"):
+                        return self._json(out, 400)
+                    self._json(out)
                 elif path == "/api/chips":
                     code = (params.get("code") or "").upper()
                     if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
@@ -194,7 +345,7 @@ def make_handler(store: DataStore, runner=None, syncer=None):
                     self._json(out)
                 elif path == "/api/trades":
                     code = (params.get("code") or "").upper() or None
-                    ts = store.trades(code)
+                    ts = store.trades(user, code)
                     # 附带股票名称/最新价快照，供交易记录页展示与浮动盈亏计算
                     meta = {}
                     for t in ts:
@@ -213,6 +364,15 @@ def make_handler(store: DataStore, runner=None, syncer=None):
                     except Exception as e:  # NewsError 及其他
                         return self._json({"error": f"新闻数据不可用: {str(e)[:120]}"}, 502)
                     self._json(data)
+                elif path == "/api/valuation":
+                    code = (params.get("code") or "").upper()
+                    if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
+                        return self._json({"error": "code 格式应为 600519.SH"}, 400)
+                    try:
+                        data = store.valuation(code, refresh=params.get("refresh") == "1")
+                    except Exception as e:  # ValuationError 及其他
+                        return self._json({"error": f"估值数据不可用: {str(e)[:120]}"}, 502)
+                    self._json(data)
                 elif path == "/api/index_kline":
                     code = (params.get("code") or "").upper()
                     data = store.index_kline(code, params.get("start"), params.get("end"))
@@ -227,6 +387,11 @@ def make_handler(store: DataStore, runner=None, syncer=None):
                     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
                         return self._json({"error": "date 格式应为 YYYY-MM-DD"}, 400)
                     self._json(self._minute_view(code, date))
+                elif path == "/api/hourly":
+                    code = (params.get("code") or "").upper()
+                    if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
+                        return self._json({"error": "code 格式应为 600519.SH"}, 400)
+                    self._json(self._hourly_view(code))
                 elif path == "/api/plugins":
                     if runner is None:
                         return self._json({"error": "插件分析未启用"}, 503)
@@ -255,6 +420,26 @@ def make_handler(store: DataStore, runner=None, syncer=None):
                     }
                     result = runner.run(plugin, code, **pparams)
                     self._json(result.to_dict())
+                elif path == "/api/update/status":
+                    if updater is None:
+                        return self._json({"error": "盘后自动更新未启用"}, 503)
+                    self._json(updater.get_status())
+                elif path == "/api/us_brief_push/status":
+                    if brief_pusher is None:
+                        return self._json({"error": "美股简报推送未启用"}, 503)
+                    self._json(brief_pusher.get_status())
+                elif path == "/api/notifications":
+                    nb = self._inbox(user)
+                    if nb is None:
+                        return self._json({"error": "消息中心未启用"}, 503)
+                    self._json(nb.list(
+                        limit=int(params.get("limit", 100)),
+                        since=params.get("since") or None,
+                        source=params.get("source") or None,
+                        level=params.get("level") or None,
+                        code=params.get("code") or None,
+                        unread_only=params.get("unread") == "1",
+                    ))
                 else:
                     self._json({"error": "unknown api"}, 404)
             except Exception:
@@ -268,20 +453,35 @@ def make_handler(store: DataStore, runner=None, syncer=None):
             from . import minute as minute_mod
 
             syncing = syncer is not None and code in syncer.pending()
+            # 1 分钟线源（新浪）只保留最近约 8 个交易日的滚动窗口，
+            # 更早的日期补不回来（东财 1 分钟仅当日/近 5 日，腾讯仅约 1 日，均无更深历史）
+            src_edge = time.strftime("%Y-%m-%d", time.localtime(time.time() - 14 * 86400))
+            fetchable = date >= src_edge
             df = minute_mod.load(code, store.root)
-            base = {"ok": False, "code": code, "date": date, "syncing": syncing}
+            base = {"ok": False, "code": code, "date": date, "syncing": syncing,
+                    "fetchable": fetchable}
             if df.empty:
                 base["days"] = []
-                base["error"] = (f"{code} 无本地分钟线（分钟线对自选股自动后台同步；"
-                                 f"可点「立即拉取」从新浪抓取最近约 8 个交易日）")
+                if fetchable:
+                    base["error"] = (f"{code} 无本地分钟线（分钟线对自选股自动后台同步；"
+                                     f"可点「立即拉取」从新浪抓取最近约 8 个交易日）")
+                else:
+                    base["error"] = (f"{code} 无本地分钟线，且 {date} 已超出数据源保留范围："
+                                     f"1 分钟线源（新浪/东财/腾讯）都只保留最近几个交易日，"
+                                     f"更早的分钟历史无法补拉")
                 return base
             days = sorted(df["datetime"].dt.strftime("%Y-%m-%d").unique().tolist())
             base["days"] = days
             day = df[df["datetime"].dt.strftime("%Y-%m-%d") == date]
             if day.empty:
                 rng = f"{days[0]} ~ {days[-1]}" if len(days) > 1 else days[0]
-                base["error"] = (f"{date} 无分钟数据（本地覆盖 {rng}，共 {len(days)} 个交易日；"
-                                 f"仅自选股自动同步，或点「立即拉取」抓最近约 8 个交易日）")
+                if fetchable:
+                    base["error"] = (f"{date} 无分钟数据（本地覆盖 {rng}，共 {len(days)} 个交易日；"
+                                     f"可点「立即拉取」从新浪抓最近约 8 个交易日）")
+                else:
+                    base["error"] = (f"{date} 不在本地覆盖范围（{rng}），且已超出数据源保留范围"
+                                     f"（1 分钟线源只保留最近约 8 个交易日）——更早的分钟历史"
+                                     f"无法补拉；自选股的本地分钟线从加入自选当日起自动累积")
                 return base
             day = day.sort_values("datetime", kind="stable")
             # 前一交易日收盘（分钟数据内最近一个更早的收盘，真实价口径）
@@ -294,6 +494,7 @@ def make_handler(store: DataStore, runner=None, syncer=None):
             vwap = day["amount"].cumsum() / vol_cs
             return {
                 "ok": True, "code": code, "date": date, "n": int(len(day)),
+                "fetchable": fetchable,
                 "days": days, "syncing": syncing, "prev_close": prev_close,
                 "time": day["datetime"].dt.strftime("%H:%M").tolist(),
                 "open": _f(day["open"].tolist()),
@@ -303,6 +504,37 @@ def make_handler(store: DataStore, runner=None, syncer=None):
                 "volume": _f(day["volume"].tolist()),
                 "amount": _f(day["amount"].tolist()),
                 "vwap": _f(vwap.tolist()),
+            }
+
+        def _hourly_view(self, code: str) -> dict:
+            """60 分钟 K 线视图：本地 1 分钟线聚合（真实价，仅自选股有本地数据）。"""
+            from . import minute as minute_mod
+
+            syncing = syncer is not None and code in syncer.pending()
+            df = minute_mod.load(code, store.root)
+            base = {"ok": False, "code": code, "syncing": syncing}
+            if df.empty:
+                base["days"] = []
+                base["error"] = (f"{code} 无本地分钟线，无法生成时K线（分钟线对自选股"
+                                 f"自动后台同步；加入自选后即可查看）")
+                return base
+            days = sorted(df["datetime"].dt.strftime("%Y-%m-%d").unique().tolist())
+            h = minute_mod.to_hourly(df)
+            if h.empty:
+                base["days"] = days
+                base["error"] = f"{code} 分钟线数据异常，无法聚合为 60 分钟 K 线"
+                return base
+            return {
+                "ok": True, "code": code, "syncing": syncing,
+                "dates": h["label"].tolist(),
+                "open": _f(h["open"].tolist()),
+                "high": _f(h["high"].tolist()),
+                "low": _f(h["low"].tolist()),
+                "close": _f(h["close"].tolist()),
+                # 分钟线 volume 单位是股，日线口径为手
+                "volume": [int(round(v / 100)) for v in h["volume"].tolist()],
+                "amount": _f(h["amount"].tolist()),
+                "days": days, "n_days": len(days),
             }
 
         def _post_minute(self):
@@ -322,7 +554,35 @@ def make_handler(store: DataStore, runner=None, syncer=None):
             self._json({"ok": True, "code": code, "queued": True,
                         "pending": syncer.pending()})
 
-        def _post_watchlist(self):
+        def _post_ai_analysis(self):
+            """个股 AI 综合分析：聚合插件结果 -> 云端大模型，报告缓存 data/ai/。"""
+            if runner is None:
+                return self._json({"error": "插件分析未启用，无法生成 AI 分析"}, 503)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b"{}"
+                req = json.loads(body.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                return self._json({"error": "请求体应为 JSON"}, 400)
+            code = (req.get("code") or "").upper()
+            if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
+                return self._json({"error": "code 格式应为 600519.SH"}, 400)
+            from . import ai as ai_mod
+
+            config = ai_mod.AIConfig.from_env()
+            if not config.enabled:
+                return self._json({"error": "AI 分析未配置：请在服务端设置环境变量 "
+                                            "AI_API_KEY（可选 AI_BASE_URL / AI_MODEL）后重启 analyzer"}, 503)
+            try:
+                self._json(ai_mod.generate(store, runner, code,
+                                           refresh=bool(req.get("refresh")), config=config))
+            except ai_mod.AIError as e:
+                return self._json({"error": str(e)}, e.status)
+            except Exception:
+                traceback.print_exc()
+                self._json({"error": "AI 分析生成失败"}, 500)
+
+        def _post_watchlist(self, user: str | None):
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b"{}"
@@ -332,24 +592,27 @@ def make_handler(store: DataStore, runner=None, syncer=None):
             action = req.get("action")
             try:
                 if action == "add":
-                    codes, added = store.watchlist_add(req.get("code", ""))
+                    codes, added = store.watchlist_add(user, req.get("code", ""))
                     if syncer:
                         syncer.submit(req.get("code", "").upper())
                     self._json({"codes": codes, "added": added})
                 elif action == "remove":
-                    codes, removed = store.watchlist_remove(req.get("code", ""))
+                    codes, removed = store.watchlist_remove(user, req.get("code", ""))
                     self._json({"codes": codes, "removed": removed})
+                elif action == "reorder":
+                    codes = req.get("codes")
+                    if not isinstance(codes, list) or not all(isinstance(c, str) for c in codes):
+                        return self._json({"error": "codes 应为字符串数组"}, 400)
+                    self._json({"codes": store.watchlist_reorder(user, codes), "reordered": True})
                 elif action == "clear":
-                    with store._wl_lock:
-                        store._wl_codes = []
-                        store._save_watchlist()
+                    store.watchlist_clear(user)
                     self._json({"codes": [], "cleared": True})
                 else:
-                    self._json({"error": "action 应为 add/remove/clear"}, 400)
+                    self._json({"error": "action 应为 add/remove/reorder/clear"}, 400)
             except ValueError as e:
                 self._json({"error": str(e)}, 400)
 
-        def _post_trades(self):
+        def _post_trades(self, user: str | None):
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b"{}"
@@ -360,6 +623,7 @@ def make_handler(store: DataStore, runner=None, syncer=None):
             try:
                 if action == "add":
                     trades, rec = store.trade_add(
+                        user,
                         req.get("code", ""),
                         req.get("date", ""),
                         req.get("side", ""),
@@ -371,12 +635,13 @@ def make_handler(store: DataStore, runner=None, syncer=None):
                     self._json({"code": rec["code"], "trades": trades, "added": rec})
                 elif action == "remove":
                     code = (req.get("code") or "").upper()
-                    trades, removed = store.trade_remove(code, str(req.get("id", "")))
+                    trades, removed = store.trade_remove(user, code, str(req.get("id", "")))
                     self._json({"code": code, "trades": trades, "removed": removed})
                 elif action == "update":
                     code = (req.get("code") or "").upper()
                     tid = str(req.get("id", ""))
                     trades, rec = store.trade_update(
+                        user,
                         code,
                         tid,
                         date=req.get("date"),
@@ -390,7 +655,7 @@ def make_handler(store: DataStore, runner=None, syncer=None):
                     self._json({"code": code, "trades": trades, "updated": rec})
                 elif action == "add_batch":
                     code = (req.get("code") or "").upper()
-                    trades, added, errors = store.trade_add_batch(code, req.get("trades"))
+                    trades, added, errors = store.trade_add_batch(user, code, req.get("trades"))
                     self._json({"code": code, "trades": trades, "added": added,
                                 "errors": errors, "n_added": len(added)})
                 else:
@@ -398,21 +663,104 @@ def make_handler(store: DataStore, runner=None, syncer=None):
             except ValueError as e:
                 self._json({"error": str(e)}, 400)
 
+        def _post_update(self):
+            """手动触发一轮盘后更新链路（异步；进度经 /api/update/status 查询）。"""
+            if updater is None:
+                return self._json({"error": "盘后自动更新未启用"}, 503)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b"{}"
+                json.loads(body.decode("utf-8") or "{}")  # 仅校验 JSON
+            except (ValueError, UnicodeDecodeError):
+                return self._json({"error": "请求体应为 JSON"}, 400)
+            self._json(updater.trigger(source="manual"))
+
+        def _post_us_brief_push(self):
+            """手动推送一次昨夜美股简报邮件（当日已成功时幂等跳过）。"""
+            if brief_pusher is None or not brief_pusher.cfg.enabled:
+                return self._json({"error": "美股简报推送未配置（SMTP_USER/"
+                                            "SMTP_PASS/MAIL_TO）"}, 503)
+            self._json(brief_pusher.push_once(source="manual"))
+
+        def _post_notifications(self, user: str | None):
+            nb = self._inbox(user)
+            if nb is None:
+                return self._json({"error": "消息中心未启用"}, 503)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b"{}"
+                req = json.loads(body.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                return self._json({"error": "请求体应为 JSON"}, 400)
+            action = req.get("action")
+            if action == "read":
+                ids = req.get("ids")
+                if ids is not None and (not isinstance(ids, list)
+                                        or not all(isinstance(x, str) for x in ids)):
+                    return self._json({"error": "ids 应为字符串数组"}, 400)
+                n = nb.mark_read(ids, all=bool(req.get("all")),
+                                 source=req.get("source") or None)
+                self._json({"ok": True, "marked": n})
+            elif action == "clear":
+                n = nb.clear(before_day=req.get("before_day") or None,
+                             source=req.get("source") or None)
+                self._json({"ok": True, "removed": n})
+            else:
+                self._json({"error": "action 应为 read/clear"}, 400)
+
+        def _auth_post_body(self, handler):
+            """认证类 POST 的 JSON body 读取（注册/登录共用）。"""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b"{}"
+                req = json.loads(body.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                return self._json({"error": "请求体应为 JSON"}, 400)
+            return handler(req)
+
         def do_POST(self):  # noqa: N802
             url = urlparse(self.path)
-            if url.path == "/api/watchlist":
-                return self._post_watchlist()
-            if url.path == "/api/trades":
-                return self._post_trades()
-            if url.path == "/api/minute":
+            path = url.path
+            # ---- 认证相关 POST（注册/登录/登出/改密）----
+            if path == "/api/auth/register":
+                return self._auth_post_body(self._post_auth_register)
+            if path == "/api/auth/login":
+                return self._auth_post_body(self._post_auth_login)
+            if path == "/api/auth/logout":
+                self._clear_session()
+                return self._json({"ok": True})
+            if path == "/api/auth/password":
+                return self._post_auth_password()
+            # ---- 业务 API：先鉴权（共享模式 user=None 表示共享桶）----
+            user = self._require_user() if auth is not None else None
+            if user is None and auth is not None:
+                return
+            if path == "/api/watchlist":
+                return self._post_watchlist(user)
+            if path == "/api/trades":
+                return self._post_trades(user)
+            if path == "/api/minute":
                 return self._post_minute()
+            if path == "/api/ai_analysis":
+                return self._post_ai_analysis()
+            if path == "/api/update/run":
+                return self._post_update()
+            if path == "/api/us_brief_push/run":
+                return self._post_us_brief_push()
+            if path == "/api/notifications":
+                return self._post_notifications(user)
             self._json({"error": "unknown api"}, 404)
 
         def do_GET(self):  # noqa: N802
             url = urlparse(self.path)
             path = url.path
+            if path == "/api/auth/status":
+                return self._api_auth_status()
             if path.startswith("/api/"):
-                return self._api(path, self._params())
+                user = self._require_user() if auth is not None else None
+                if user is None and auth is not None:
+                    return
+                return self._api(path, self._params(), user)
             p = _safe_static(path)
             if p is None:
                 return self._json({"error": "not found"}, 404)
@@ -422,17 +770,33 @@ def make_handler(store: DataStore, runner=None, syncer=None):
     return Handler
 
 
-def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765):
+def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765,
+          auth_enabled: bool = True):
+    """启动仪表盘。auth_enabled=True 时启用多用户登录（自选/交易/站内信按用户
+    隔离，存 data/users/{user}/）；False 为免登录共享单用户模式（沿用根级
+    watchlist.json / trades.json，与旧版本行为一致）。"""
     store = DataStore(data_dir)
 
-    # 自选股分钟线后台同步：启动即同步已有自选，之后加自选即入队，每 30 分钟增量刷新
+    # 多用户登录（默认启用）
+    auth = None
+    if auth_enabled:
+        auth = AuthManager(data_dir)
+        if auth.users():
+            print(f"多用户登录: 已启用（{len(auth.users())} 个用户: "
+                  f"{', '.join(auth.users())}）")
+        else:
+            print("多用户登录: 已启用（尚无用户——首个注册的用户将继承现有"
+                  "自选股/交易记录/站内信）")
+
+    # 自选股分钟线后台同步：启动即同步「全部用户自选并集」，每 30 分钟增量刷新
     from .minute import MinuteSyncer
 
     syncer = MinuteSyncer(data_dir)
-    syncer.set_watchlist_reader(lambda: list(store._wl_codes))
-    if store._wl_codes:
-        print(f"自选股 {len(store._wl_codes)} 只，后台开始同步分钟线…")
-        for c in list(store._wl_codes):
+    syncer.set_watchlist_reader(store.watchlist_codes_all)
+    wl_all = store.watchlist_codes_all()
+    if wl_all:
+        print(f"自选股（全部用户并集）{len(wl_all)} 只，后台开始同步分钟线…")
+        for c in wl_all:
             syncer.submit(c)
 
     runner = None
@@ -458,7 +822,46 @@ def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765):
     except Exception as e:  # 插件框架缺失/损坏不阻塞仪表盘主功能
         print(f"警告: 插件分析不可用（{e}），/api/plugins* 将返回 503")
 
-    httpd = ThreadingHTTPServer((host, port), make_handler(store, runner=runner, syncer=syncer))
+    from .ai import AIConfig
+
+    ai_cfg = AIConfig.from_env()
+    if ai_cfg.enabled:
+        print(f"AI 分析: 已启用（模型 {ai_cfg.model} · {ai_cfg.base_url}）")
+    else:
+        print("AI 分析: 未启用（设置环境变量 AI_API_KEY 后可用，可选 AI_BASE_URL/AI_MODEL）")
+
+    # 消息中心 + 盘后自动更新：每交易日 15:30（CST）触发全量更新，
+    # 自选股数据优先刷新，更新完成后扫描自选股模型信号并推送提醒。
+    from .notify import NotificationHub, NotificationCenter
+    from .updates import EodUpdater
+
+    if auth is not None:
+        # 多用户：每用户独立收件箱（data/users/{user}/notifications.jsonl）；
+        # 带 code 的信号只推给自选含该股的用户，系统消息推给全部用户
+        notifier = NotificationHub(data_dir, users_provider=auth.users,
+                                   watchlist_provider=store.watchlist_codes)
+    else:
+        notifier = NotificationCenter(data_dir)
+    updater = EodUpdater(
+        store, notifier, data_dir=data_dir,
+        on_cache_invalidate=(runner.clear_cache if runner is not None else None),
+        runner=runner, syncer=syncer,
+    )
+    updater.start()
+    print(f"盘后自动更新: 已启用（每交易日 {updater.status['trigger']} CST 触发，"
+          f"自选股优先刷新 + 信号提醒；POST /api/update/run 可手动触发）")
+
+    # 昨夜美股简报邮件推送（借 iam 服务器 trending 项目的 email 渠道做法）：
+    # 每工作日 08:40 CST 把 data/news/us_market/当日.md 渲染成 HTML 邮件推送；
+    # 未配置 SMTP_USER/SMTP_PASS/MAIL_TO 时自动停用，不影响其余功能。
+    from .overseas_push import pusher_from_env
+
+    brief_pusher = pusher_from_env(data_dir, notifier=notifier)
+    brief_pusher.start()
+
+    httpd = ThreadingHTTPServer((host, port), make_handler(
+        store, runner=runner, syncer=syncer, notifier=notifier, updater=updater,
+        auth=auth, brief_pusher=brief_pusher))
     url = f"http://{host}:{port}/"
     print(f"数据加载完成: {store.meta['n_stocks']} 只股票 | "
           f"{store.meta['date_min']} ~ {store.meta['date_max']} | "

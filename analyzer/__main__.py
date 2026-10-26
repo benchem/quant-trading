@@ -17,6 +17,13 @@ def main(argv: list[str] | None = None) -> int:
     p_serve = sub.add_parser("serve", help="启动本地交互式仪表盘（默认命令）")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8765)
+    p_serve.add_argument("--no-auth", action="store_true",
+                         help="关闭多用户登录（免登录共享单用户模式，沿用根级 watchlist.json/trades.json）")
+
+    p_user = sub.add_parser("user", help="多用户管理（list 列出 / add 新建 / passwd 重置密码）")
+    p_user.add_argument("op", choices=["list", "add", "passwd"],
+                        help="list 列出用户 / add 新建 / passwd 重置密码")
+    p_user.add_argument("name", nargs="?", help="用户名（add/passwd 必填）")
 
     p_report = sub.add_parser("report", help="输出 matplotlib 静态 PNG 报告")
     p_report.add_argument("--out", default="analyzer/output")
@@ -85,10 +92,56 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("需要 --codes 或 --all")
         return 2
 
-    if args.cmd == "minute":
-        import json
-        from pathlib import Path
+    if args.cmd == "user":
+        import getpass
 
+        from .auth import AuthManager
+
+        am = AuthManager(args.data_dir)
+        if args.op == "list":
+            users = am.users()
+            if not users:
+                print("（暂无用户；首次访问网页注册即创建，或在命令行 user add）")
+            for u in users:
+                print(f"  {u}")
+            return 0
+        if not args.name:
+            ap.error(f"user {args.op} 需要用户名")
+            return 2
+        if args.op == "add":
+            if am.user_exists(args.name):
+                print(f"  ✗ 用户 {args.name} 已存在")
+                return 1
+            pw = getpass.getpass(f"为用户 {args.name} 设置密码: ")
+            pw2 = getpass.getpass("重复密码: ")
+            if pw != pw2:
+                print("  ✗ 两次密码不一致")
+                return 1
+            try:
+                info = am.create_user(args.name, pw)
+            except ValueError as e:
+                print(f"  ✗ {e}")
+                return 1
+            print(f"  ✓ 已创建用户 {info['name']}")
+            return 0
+        # passwd
+        if not am.user_exists(args.name):
+            print(f"  ✗ 用户 {args.name} 不存在")
+            return 1
+        pw = getpass.getpass(f"重置 {args.name} 的密码: ")
+        pw2 = getpass.getpass("重复密码: ")
+        if pw != pw2:
+            print("  ✗ 两次密码不一致")
+            return 1
+        try:
+            am.change_password(args.name, pw)
+        except ValueError as e:
+            print(f"  ✗ {e}")
+            return 1
+        print(f"  ✓ 已重置 {args.name} 的密码")
+        return 0
+
+    if args.cmd == "minute":
         from .minute import fetch, info
 
         if args.codes:
@@ -103,10 +156,9 @@ def main(argv: list[str] | None = None) -> int:
                 except ValueError as e:
                     print(f"  ✗ {e}")
         else:
-            try:
-                codes = json.loads((Path(args.data_dir) / "watchlist.json").read_text())["codes"]
-            except Exception:
-                codes = []
+            from .auth import all_watchlist_codes
+
+            codes = all_watchlist_codes(args.data_dir)
             if not codes:
                 print("自选股为空（先在网页 ★ 加自选，或用 --codes 指定）")
                 return 0
@@ -128,7 +180,11 @@ def main(argv: list[str] | None = None) -> int:
     # 默认 / serve
     from .server import serve
 
-    serve(args.data_dir, args.host, args.port)
+    # 不带子命令直跑时 argparse 不会填充 serve 的默认值，这里兜底
+    serve(args.data_dir,
+          getattr(args, "host", "127.0.0.1"),
+          getattr(args, "port", 8765),
+          auth_enabled=not getattr(args, "no_auth", False))
     return 0
 
 

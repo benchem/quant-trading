@@ -63,6 +63,10 @@ class AnalysisContext:
         if callable(c):
             c()
 
+    def clear_cache(self):
+        """清空 kline 缓存（本地日线数据更新后由调度器调用，下一请求重读磁盘）。"""
+        self._kline_cache.clear()
+
     # ------------------------------------------------------------ 元信息
 
     @property

@@ -34,6 +34,41 @@ def _split_codes(s: str) -> list[str]:
     return [x for x in re.split(r"[,，;\s]+", str(s).strip()) if x]
 
 
+#: 复权序列单日|跳变|超过该值视为复权单位断裂（涨跌停上限: 主板10%/创业板科创板20%/北交所30%）
+UNIT_JUMP_LIMIT = 0.32
+
+
+def _reject_unit_anomaly(old: Optional[pd.DataFrame], new: pd.DataFrame,
+                         limit: float = UNIT_JUMP_LIMIT) -> str:
+    """复权(hfq/qfq)序列按构造是连续的；校验新数据并入后是否出现不可能的大跳变。
+
+    2026-10-25 事故: 腾讯源对无交易日窗口回退返回最新一根【未复权】bar 混入 hfq 序列，
+    末根出现 -35%~-98% 的假跳变，前复权折算因子塌缩为 1。这里在合并前拦截：
+    只检查「相邻对中后一行来自新数据」的跳变（不检查旧数据内部，避免历史遗留异常
+    永久阻塞增量更新）。旧数据不足 6 根不校验（上市初期无涨跌停限制）。
+    大比例缩股除权日 hfq 也会出现 >32% 的真实跳变（罕见），被误拦时仅跳过当日更新。
+    返回非空原因字符串表示拒绝；空串放行。仅对 hfq/qfq 调用（none 除权跳空正常）。
+    """
+    if new is None or len(new) == 0 or old is None or len(old) < 6:
+        return ""
+    o = old[["date", "close"]].copy()
+    o["_new"] = False
+    n = new[["date", "close"]].copy()
+    n["_new"] = True
+    m = pd.concat([o, n], ignore_index=True)
+    m["date"] = pd.to_datetime(m["date"])
+    m = m.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    c = pd.to_numeric(m["close"], errors="coerce").astype(float)
+    ret = c.pct_change().abs()
+    bad = ret.where(m["_new"]) > limit
+    if bad.any():
+        i = int(bad.idxmax())
+        return (f"疑似复权单位断裂: {m['date'].iloc[i].date()} 单日|涨跌|"
+                f"{ret.iloc[i] * 100:.1f}% 超过 {limit * 100:.0f}%"
+                f"（前收 {c.iloc[i - 1]:.3f} -> {c.iloc[i]:.3f}），已保留旧数据")
+    return ""
+
+
 def _make_rotator():
     """探测 Clash 并创建节点轮换器；不可用时返回 None（降级为纯冷却）。"""
     from .proxy import ClashAPI, ProxyRotator
@@ -56,6 +91,7 @@ _STAT_LABEL = {
     "updated": "增量更新",
     "uptodate": "已是最新",
     "nodata": "区间无数据",
+    "skipped": "疑似单位异常已跳过",
     "failed": "失败",
 }
 
@@ -87,6 +123,74 @@ class Downloader:
         if p.exists():
             return pd.read_parquet(p, engine="pyarrow")
         return self.refresh_stock_list()
+
+    def refresh_boards(self, with_concept: bool = False) -> pd.DataFrame:
+        """刷新板块成分表（行业板块必抓；概念板块 --with-concept 时一并抓取）。
+
+        行业板块：东财行业分类（每板块一次请求约 2 分钟），东财不可用时自动降级
+        baostock 证监会行业分类。概念板块：仅东财源（约 500 个题材/风格标签，
+        成分有重叠），东财不可用时保留旧缓存的概念行。
+        单板块抓取失败时保留本地旧缓存中该板块的行（重跑同一命令自动补齐）。
+        """
+        valid = None
+        lp = store.stock_list_path(self.data_dir)
+        if lp.exists():
+            valid = set(pd.read_parquet(lp, engine="pyarrow")["code"])
+        path = store.board_members_path(self.data_dir)
+        old = None
+        if path.exists():
+            old = pd.read_parquet(path, engine="pyarrow")
+            if "board_type" not in old.columns:
+                old["board_type"] = "industry"
+
+        ind, failed_ind = with_retry(
+            lambda: source.fetch_board_members(valid, "industry"), desc="行业板块成分")
+        if failed_ind:
+            _log(f"行业板块: {len(failed_ind)} 个板块本次抓取失败"
+                 f"（沿用旧缓存，重跑可补齐）: {', '.join(failed_ind[:15])}"
+                 f"{' …' if len(failed_ind) > 15 else ''}")
+            if old is not None:
+                keep = old[(old["board_type"] == "industry")
+                           & (old["board_code"].isin(set(failed_ind)))]
+                ind = pd.concat([ind, keep], ignore_index=True)
+                ind = ind.drop_duplicates("code", keep="first")
+
+        parts = [ind]
+        if with_concept:
+            try:
+                cpt, failed_cpt = with_retry(
+                    lambda: source.fetch_board_members(valid, "concept"), desc="概念板块成分")
+                parts.append(cpt)
+                if failed_cpt:
+                    _log(f"概念板块: {len(failed_cpt)} 个板块本次抓取失败"
+                         f"（沿用旧缓存，重跑可补齐）: {', '.join(failed_cpt[:15])}"
+                         f"{' …' if len(failed_cpt) > 15 else ''}")
+                    if old is not None:
+                        keep = old[(old["board_type"] == "concept")
+                                   & (old["board_code"].isin(set(failed_cpt)))]
+                        cpt = pd.concat([cpt, keep], ignore_index=True)
+                        cpt = cpt.drop_duplicates(["code", "board_code"], keep="first")
+                        parts[-1] = cpt
+            except Exception as e:  # noqa: BLE001 概念失败不阻塞行业部分
+                _log(f"概念板块抓取失败（保留旧缓存概念行）: {e}")
+                if old is not None:
+                    old_cpt = old[old["board_type"] == "concept"]
+                    if len(old_cpt):
+                        parts.append(old_cpt)
+        elif old is not None:
+            old_cpt = old[old["board_type"] == "concept"]
+            if len(old_cpt):
+                parts.append(old_cpt)  # 未要求刷新概念时保留既有概念数据
+
+        df = pd.concat(parts, ignore_index=True)
+        df = df.drop_duplicates(["code", "board_code"], keep="first")
+        df = df.sort_values(["code", "board_code"]).reset_index(drop=True)
+        store.save_parquet(path, df)
+        n_ind = int(df.loc[df["board_type"] == "industry", "board_code"].nunique())
+        n_cpt = int(df.loc[df["board_type"] == "concept", "board_code"].nunique())
+        _log(f"板块成分已刷新: {n_ind} 个行业板块 / {n_cpt} 个概念板块"
+             f"（{df['code'].nunique()} 只股票）-> {path}")
+        return df
 
     def refresh_trade_calendar(self) -> pd.Series:
         dates = with_retry(source.fetch_trade_dates, desc="交易日历")
@@ -145,6 +249,11 @@ class Downloader:
             return code, "failed", f"{type(e).__name__}: {e}"
         if df is None or len(df) == 0:
             return (code, "uptodate", "") if old is not None and len(old) else (code, "nodata", "")
+        if self.adjust in ("hfq", "qfq"):
+            reason = _reject_unit_anomaly(old, df)
+            if reason:
+                _log(f"跳过 {code}: {reason}")
+                return code, "skipped", reason
         merged = store.merge_daily(old, df)
         store.save_parquet(path, merged)
         return code, ("new" if old is None or len(old) == 0 else "updated"), ""
@@ -180,7 +289,7 @@ class Downloader:
         if self.adjust == "qfq":
             _log("提示: 前复权数据每次都会整段重新下载（历史随分红重写），建模推荐用后复权(hfq)。")
 
-        stats = {"new": 0, "updated": 0, "uptodate": 0, "nodata": 0, "failed": 0}
+        stats = {"new": 0, "updated": 0, "uptodate": 0, "nodata": 0, "failed": 0, "skipped": 0}
         failures: list[tuple[str, str]] = []
         t0 = time.time()
         pool = ThreadPoolExecutor(max_workers=self.workers)
@@ -408,6 +517,20 @@ class Downloader:
             _log(f"  沪 {by_market['SH']} | 深 {by_market['SZ']} | 北 {by_market['BJ']}")
             if ltd is not None and stale:
                 _log(f"  落后最近交易日: {stale} 只（可能停牌或已退市）")
+
+        bd = store.board_members_path(self.data_dir)
+        if bd.exists():
+            df = pd.read_parquet(bd, engine="pyarrow")
+            mtime = dt.datetime.fromtimestamp(bd.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            if "board_type" in df.columns:
+                n_ind = int(df.loc[df["board_type"] == "industry", "board_code"].nunique())
+                n_cpt = int(df.loc[df["board_type"] == "concept", "board_code"].nunique())
+                desc = f"{n_ind} 个行业板块" + (f" / {n_cpt} 个概念板块" if n_cpt else "")
+            else:
+                desc = f"{df['board_code'].nunique()} 个行业板块"
+            _log(f"板块成分: {desc} / {df['code'].nunique()} 只股票 (更新于 {mtime})")
+        else:
+            _log("板块成分: 未下载（运行: python -m downloader board）")
 
         idx_files = sorted(store.index_dir(self.data_dir).glob("*.parquet"))
         if idx_files:

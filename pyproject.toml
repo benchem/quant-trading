@@ -28,6 +28,7 @@ stock-analysis = "stock_analysis.cli:main"
 packages = [
     "downloader",
     "analyzer",
+    "notifybox",
     "stock_analysis",
     "stock_analysis.core",
     "stock_analysis.plugins",

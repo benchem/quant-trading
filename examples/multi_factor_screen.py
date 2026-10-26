@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import sys
 import time
@@ -44,9 +43,11 @@ def collect_codes(args) -> list[str]:
         for c in args.codes:
             codes.append(c)
         if not codes:
-            wl = ROOT / "data" / "watchlist.json"
-            if wl.exists():
-                codes = json.loads(wl.read_text())["codes"]
+            # 缺省用自选股：兼容免登录共享模式(根级 watchlist.json)与
+            # 多用户登录模式(data/users/*/watchlist.json)，取全部并集
+            from analyzer.auth import all_watchlist_codes
+
+            codes = all_watchlist_codes(ROOT / "data")
     return codes
 
 

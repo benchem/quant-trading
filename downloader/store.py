@@ -43,6 +43,10 @@ def trade_cal_path(data_dir) -> Path:
     return Path(data_dir) / "trade_calendar.parquet"
 
 
+def board_members_path(data_dir) -> Path:
+    return Path(data_dir) / "board_members.parquet"
+
+
 def save_parquet(path: Path, df: pd.DataFrame) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

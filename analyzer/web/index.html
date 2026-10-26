@@ -10,26 +10,40 @@
 <header>
   <div class="brand">📈 A股数据分析仪表盘</div>
   <div class="meta" id="meta-line">加载中…</div>
+  <span class="header-spacer"></span>
+  <button class="hdr-btn" id="update-chip" title="每日交易日 15:30（CST）自动盘后更新：自选股数据优先刷新，再走全市场。点击可立即手动触发一轮更新">
+    <span id="update-dot" class="update-dot idle"></span><span id="update-text">盘后更新</span>
+  </button>
+  <button class="hdr-btn" id="msg-btn" title="消息中心：模型信号、交易提醒与更新进度的统一收件箱（快速预览）">
+    🔔<span class="msg-badge" id="msg-badge" style="display:none">0</span>
+  </button>
+  <span class="hdr-user" id="hdr-user" style="display:none" title="当前登录用户（数据按用户隔离）">
+    <span class="hdr-user-name" id="user-name"></span>
+    <button class="hdr-btn" id="logout-btn" title="退出登录（切换到其他用户）">退出</button>
+  </span>
 </header>
 
 <nav class="tabs">
-  <button class="tab active" data-tab="market">市场概览</button>
+  <button class="tab active" data-tab="market">市场</button>
   <button class="tab" data-tab="stock">个股分析</button>
-  <button class="tab" data-tab="rank">排行榜</button>
   <button class="tab" data-tab="trades">交易记录</button>
+  <button class="tab" data-tab="inbox">站内信<span class="tab-badge" id="inbox-tab-badge" style="display:none">0</span></button>
 </nav>
 
 <main>
   <!-- ===================== 市场概览 ===================== -->
   <section id="tab-market" class="panel active">
     <div class="toolbar">
-      <span class="toolbar-label">区间</span>
+      <span class="toolbar-label">区间（图表与排行榜共用）</span>
       <div class="btn-group" id="market-period">
-        <button data-days="365">1年</button>
+        <button data-days="31">1月</button>
+        <button data-days="92">3月</button>
+        <button data-days="183">6月</button>
+        <button data-days="365" class="active">1年</button>
         <button data-days="1095">3年</button>
-        <button data-days="1825">5年</button>
+        <button data-days="1826">5年</button>
         <button data-days="3650">10年</button>
-        <button data-days="0" class="active">全部</button>
+        <button data-days="0">全部</button>
       </div>
     </div>
 
@@ -55,19 +69,95 @@
         <div class="chart" id="chart-nav"></div>
       </div>
     </div>
+
+    <!-- ===== 排行榜（并入本页，与上方图表共用区间） ===== -->
+    <div class="section-title" id="rank-anchor">排行榜（与上方图表同区间）</div>
+    <div class="toolbar">
+      <span class="toolbar-label">视图</span>
+      <div class="btn-group" id="rank-view">
+        <button data-view="stock" class="active">个股</button>
+        <button data-view="board">板块</button>
+      </div>
+      <span class="toolbar-label" id="rank-market-label">市场</span>
+      <select id="rank-market" class="select" title="市场板块（按代码规则：沪主板/深主板/创业板/科创板/北交所）">
+        <option value="">全部市场</option>
+      </select>
+      <span class="toolbar-label" id="rank-board-label">板块</span>
+      <select id="rank-board" class="select" title="按板块过滤个股（数据: python -m downloader board）">
+        <option value="">全部板块</option>
+      </select>
+      <span class="toolbar-label" id="board-type-label" style="display:none">板块类型</span>
+      <div class="btn-group" id="board-type" style="display:none">
+        <button data-btype="industry" class="active">行业</button>
+        <button data-btype="concept">概念</button>
+      </div>
+      <span class="toolbar-label">指标</span>
+      <select id="rank-metric" class="select">
+        <option value="ret">区间涨跌幅</option>
+        <option value="vol">年化波动率</option>
+        <option value="maxdd">最大回撤</option>
+        <option value="turnover">平均换手率</option>
+      </select>
+      <select id="rank-dir" class="select">
+        <option value="0">最前（高→低）</option>
+        <option value="1">最后（低→高）</option>
+      </select>
+      <select id="rank-n" class="select">
+        <option value="20">20 只</option>
+        <option value="50" selected>50 只</option>
+        <option value="100">100 只</option>
+      </select>
+    </div>
+    <div class="table-wrap" id="rank-stock-wrap">
+      <table class="rank-table" id="rank-table">
+        <thead>
+          <tr>
+            <th>#</th><th>代码</th><th>名称</th><th>板块</th>
+            <th class="num">区间涨跌幅</th>
+            <th class="num">年化波动</th>
+            <th class="num">最大回撤</th>
+            <th class="num">平均换手</th>
+            <th class="num">总市值</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="table-wrap" id="rank-board-wrap" style="display:none">
+      <table class="rank-table" id="board-table">
+        <thead>
+          <tr>
+            <th>#</th><th>板块</th>
+            <th class="num">区间涨跌幅</th>
+            <th class="num">年化波动</th>
+            <th class="num">最大回撤</th>
+            <th class="num">平均换手</th>
+            <th class="num">涨</th>
+            <th class="num">跌</th>
+            <th class="num">成分股</th>
+            <th class="num">板块总市值</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="hint" id="rank-hint">个股：点击行跳转个股分析，点击「板块」列按板块筛选；板块：成分股等权聚合（涨/跌=区间内上涨/下跌家数），点击行按该股池筛选个股；概念板块成分有重叠，跨概念无加总意义</div>
   </section>
 
   <!-- ===================== 个股分析 ===================== -->
   <section id="tab-stock" class="panel">
     <div class="chart-box" id="watchlist-box" style="display:none">
       <div class="chart-title">
+        <button id="wl-collapse" class="mini-btn wl-collapse-btn" title="折叠/展开自选股列表">▾</button>
         自选股（<span id="wl-count">0</span>）
+        <span class="hint" style="margin:0" title="拖动行首 ⠿ 调整顺序，顺序持久化保存">⇅ 可拖动排序</span>
         <button id="wl-clear" class="mini-btn" title="清空全部自选">清空</button>
       </div>
       <div class="table-wrap" style="max-height:300px">
         <table class="rank-table" id="wl-table">
           <thead>
             <tr>
+              <th class="wl-drag-h" title="拖动调整顺序"></th>
               <th>代码</th><th>名称</th>
               <th class="num">真实价</th>
               <th class="num">后复权价</th>
@@ -123,9 +213,17 @@
 
     <div class="chart-box">
       <div class="chart-title">
-        日K线（前复权 · 最新价=真实价）· 均线 · 成交量 · <span style="color:var(--up)">▲买</span> / <span style="color:var(--down)">▼卖</span>
-        <span style="color:var(--accent)" title="点击任意一根日K线，查看该日 1 分钟分时（需本地分钟数据，自选股自动同步）">🖱 点K线看当日分时</span>
+        <span id="kline-title">日K线（前复权 · 最新价=真实价）</span> · 均线 · 成交量 · <span style="color:var(--up)">▲买</span> / <span style="color:var(--down)">▼卖</span>
+        <div class="btn-group kline-freq" id="kline-freq" title="K线周期切换">
+          <button data-freq="60" title="60分钟K线（本地1分钟线聚合，真实价；仅自选股有本地分钟数据）">时</button>
+          <button data-freq="d" class="active">日</button>
+          <button data-freq="w" title="由日线聚合为周K线">周</button>
+          <button data-freq="m" title="由日线聚合为月K线">月</button>
+        </div>
+        <span id="kline-click-hint" style="color:var(--accent)" title="点击任意一根日K线，查看该日 1 分钟分时（需本地分钟数据，自选股自动同步）">🖱 点K线看当日分时</span>
+        <span id="kline-range" class="hint" style="margin:0"></span>
         <span id="trade-summary" class="trade-summary"></span>
+        <button id="trade-detail-toggle" class="mini-btn trade-btn" style="display:none" title="展开/隐藏 K 线下方的交易明细表">▾ 交易明细</button>
         <button id="trade-btn" class="mini-btn trade-btn" title="到「交易记录」页登记 / 编辑 / 删除买卖（展示在 K 线上）">管理交易 →</button>
       </div>
 
@@ -155,6 +253,7 @@
       <button class="subtab" data-sub="cd">筹码分布</button>
       <button class="subtab" data-sub="bb">布林通道</button>
       <button class="subtab" data-sub="fund">财报</button>
+      <button class="subtab" data-sub="ai">AI 分析</button>
     </div>
 
     <div class="subpanel active" data-subpanel="cmp">
@@ -338,9 +437,25 @@
         <div class="hint" id="fund-hint">首次打开某只股票时在线抓取（约 1~2 秒），之后走本地缓存</div>
       </div>
     </div>
+
+    <div class="subpanel" data-subpanel="ai">
+      <div class="chart-box">
+        <div class="chart-title">
+          AI 综合分析（汇总多因子 / GARCH / 筹码 / 布林 / 动量 / 风险 / 财报模型结果与近期新闻，由云端大模型生成）
+          <span id="ai-status" class="hint"></span>
+        </div>
+        <div class="ai-actions">
+          <button id="ai-generate" class="mini-btn">生成 AI 分析</button>
+          <button id="ai-refresh" class="mini-btn" style="display:none" title="忽略缓存，重新调用大模型">重新生成</button>
+          <span class="hint" id="ai-meta" style="margin:0"></span>
+        </div>
+        <div class="hint" id="ai-hint"></div>
+        <div id="ai-report" class="ai-report"></div>
+        <div class="hint" id="ai-context"></div>
+      </div>
+    </div>
   </section>
 
-  <!-- ===================== 排行榜 ===================== -->
   <!-- ===================== 交易记录（自选股买卖台账 CRUD） ===================== -->
   <section id="tab-trades" class="panel">
     <div class="toolbar">
@@ -458,72 +573,53 @@
     </div>
 
     <div class="chart-box">
-      <div class="chart-title">交易流水（按时间倒序 · 费用列留空笔按费率估算）</div>
+      <div class="chart-title">交易流水（按股票分组记账：借=买入 / 贷=卖出 · 组内小计 · 页脚总计）</div>
       <div class="table-wrap" style="max-height:520px">
         <table class="rank-table" id="trades-table">
           <thead>
             <tr>
-              <th>代码</th><th>名称</th>
               <th>日期</th>
               <th>方向</th>
-              <th class="num">价格</th>
               <th class="num">股数</th>
-              <th class="num">金额</th>
+              <th class="num">价格</th>
+              <th class="num" title="借方：买入成交额">买入金额</th>
+              <th class="num" title="贷方：卖出成交额">卖出金额</th>
               <th class="num">费用</th>
+              <th class="num" title="该笔成交后此股的持股数（按该股全部记录逐笔累计）">持仓余额</th>
               <th>备注</th>
               <th class="num">操作</th>
             </tr>
           </thead>
           <tbody></tbody>
+          <tfoot></tfoot>
         </table>
       </div>
     </div>
   </section>
 
-  <section id="tab-rank" class="panel">
-    <div class="toolbar">
-      <span class="toolbar-label">区间</span>
-      <div class="btn-group" id="rank-period">
-        <button data-days="31">1月</button>
-        <button data-days="92">3月</button>
-        <button data-days="183">6月</button>
-        <button data-days="365" class="active">1年</button>
-        <button data-days="1095">3年</button>
-        <button data-days="1826">5年</button>
+  <!-- ===================== 站内信（统一收件箱） ===================== -->
+  <section id="tab-inbox" class="panel">
+    <div class="inbox-wrap">
+      <aside class="inbox-rail" id="inbox-rail"></aside>
+      <div class="inbox-main">
+        <div class="inbox-toolbar">
+          <label class="inbox-filter"><input type="checkbox" id="inbox-unread"> 只看未读</label>
+          <select id="inbox-level" class="inbox-select">
+            <option value="">全部级别</option>
+            <option value="alert">触发</option>
+            <option value="warn">提醒</option>
+            <option value="ok">完成</option>
+            <option value="info">进度</option>
+          </select>
+          <span class="hint" id="inbox-sub" style="margin:0"></span>
+          <span style="flex:1"></span>
+          <button class="mini-btn" id="inbox-read" title="把当前分类全部标记已读">当前分类全部已读</button>
+          <button class="mini-btn" id="inbox-clear" title="清空当前分类的历史消息">清空</button>
+          <button class="mini-btn" id="inbox-refresh" title="重新拉取">⟳ 刷新</button>
+        </div>
+        <div class="inbox-list" id="inbox-list"><div class="msg-empty">加载中…</div></div>
       </div>
-      <span class="toolbar-label">指标</span>
-      <select id="rank-metric" class="select">
-        <option value="ret">区间涨跌幅</option>
-        <option value="vol">年化波动率</option>
-        <option value="maxdd">最大回撤</option>
-        <option value="turnover">平均换手率</option>
-      </select>
-      <select id="rank-dir" class="select">
-        <option value="0">最前（高→低）</option>
-        <option value="1">最后（低→高）</option>
-      </select>
-      <select id="rank-n" class="select">
-        <option value="20">20 只</option>
-        <option value="50" selected>50 只</option>
-        <option value="100">100 只</option>
-      </select>
     </div>
-    <div class="table-wrap">
-      <table class="rank-table" id="rank-table">
-        <thead>
-          <tr>
-            <th>#</th><th>代码</th><th>名称</th>
-            <th class="num">区间涨跌幅</th>
-            <th class="num">年化波动</th>
-            <th class="num">最大回撤</th>
-            <th class="num">平均换手</th>
-            <th class="num">总市值</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </div>
-    <div class="hint" id="rank-hint">点击表格行可跳转到个股分析</div>
   </section>
 </main>
 
@@ -532,6 +628,47 @@
 </footer>
 
 <div id="toast"></div>
+
+<!-- ===== 登录 / 注册浮层（多用户数据隔离） ===== -->
+<div class="auth-overlay" id="auth-overlay" style="display:none">
+  <div class="auth-mask"></div>
+  <div class="auth-card">
+    <div class="auth-title">📈 A股数据分析仪表盘</div>
+    <div class="auth-sub">登录后使用 —— 每位用户的自选股、交易记录与站内信相互隔离</div>
+    <div class="btn-group auth-tabs" id="auth-tabs">
+      <button data-mode="login" class="active">登录</button>
+      <button data-mode="register">注册新用户</button>
+    </div>
+    <input class="auth-input" id="auth-user" type="text" placeholder="用户名（2~32 位字母/数字/_/-）"
+           autocomplete="username" spellcheck="false">
+    <input class="auth-input" id="auth-pass" type="password" placeholder="密码（至少 6 位）"
+           autocomplete="current-password">
+    <input class="auth-input" id="auth-pass2" type="password" placeholder="重复密码"
+           autocomplete="new-password" style="display:none">
+    <div class="auth-err" id="auth-err"></div>
+    <button class="auth-btn" id="auth-submit">登 录</button>
+    <div class="auth-hint" id="auth-hint" style="display:none">
+      尚无用户：首个注册的用户将自动继承升级前已有的自选股、交易记录与站内信
+    </div>
+  </div>
+</div>
+
+<!-- ===== 消息中心抽屉（更新进度 + 自选股信号提醒） ===== -->
+<div class="msg-drawer" id="msg-drawer">
+  <div class="msg-head">
+    <b>消息中心</b>
+    <span class="hint" style="margin:0" id="msg-sub"></span>
+    <span style="flex:1"></span>
+    <button class="mini-btn" id="msg-open-inbox" title="打开整页收件箱">收件箱 ›</button>
+    <button class="mini-btn" id="msg-read" title="全部标记已读">全部已读</button>
+    <button class="mini-btn" id="msg-close" title="关闭">✕</button>
+  </div>
+  <div class="msg-progress" id="msg-progress" style="display:none">
+    <div class="msg-prog-line"><span id="msg-prog-stage"></span><span id="msg-prog-pct"></span></div>
+    <div class="msg-bar"><div class="msg-bar-fill" id="msg-bar-fill"></div></div>
+  </div>
+  <div class="msg-list" id="msg-list"></div>
+</div>
 
 <div class="modal" id="minute-modal">
   <div class="modal-mask" id="minute-mask"></div>

@@ -45,6 +45,25 @@ INDEX_NAMES = {
 _RANK_METRICS = ("ret", "vol", "maxdd", "turnover")
 _RANK_CACHE_MAX = 16
 
+#: 市场板块（交易所板块划分，按代码前缀本地推导，无需外部数据）: key -> (名称, 代码前缀)
+# 沪市 60x/605=主板、688/689=科创板；深市 00x=主板、300/301/302=创业板；北交所 43/83/87/92x
+MARKET_SEGMENTS = (
+    ("sh_main", "沪主板", ("600", "601", "603", "605")),
+    ("sz_main", "深主板", ("000", "001", "002", "003")),
+    ("cyb", "创业板", ("300", "301", "302")),
+    ("kcb", "科创板", ("688", "689")),
+    ("bj", "北交所", ("43", "83", "87", "88", "92")),
+)
+
+
+def market_of(code: str) -> str | None:
+    """代码 -> 市场板块 key（沪主板/深主板/创业板/科创板/北交所）；无法识别返回 None。"""
+    num = code.split(".")[0]
+    for key, _name, prefixes in MARKET_SEGMENTS:
+        if num.startswith(prefixes):
+            return key
+    return None
+
 #: 交易流水记录上限（全部股票合计）
 _MAX_TRADES = 5000
 _MAX_BATCH = 500  # 单次批量导入上限
@@ -68,20 +87,36 @@ class DataStore:
         self._rank_order: list[tuple] = []
         self._chips_cache: dict[str, dict] = {}
         self._last_cache: dict[str, dict | None] = {}
+        self._daily_cache: dict[str, pd.DataFrame | None] = {}
 
-        self._wl_path = self.root / "watchlist.json"
-        self._wl_lock = threading.Lock()
-        self._wl_codes: list[str] = self._load_watchlist()
-
-        self._trades_path = self.root / "trades.json"
-        self._trades_lock = threading.Lock()
-        self._trades: list[dict] = self._load_trades()
+        # 多用户数据隔离：自选股/交易流水按用户分桶（data/users/{user}/），
+        # 首次访问惰性加载；user=None 为「共享」单用户模式（serve --no-auth），
+        # 沿用根级 watchlist.json / trades.json，与升级前行为完全一致。
+        self._buckets: dict[str | None, dict] = {}
+        self._buckets_lock = threading.Lock()
 
         t0 = time.time()
+        self._load_all(t0)
+
+    # ------------------------------------------------------------- reload
+
+    def _load_all(self, t0: float) -> None:
+        """加载/重载全部启动数据（构造与 reload() 共用）。
+
+        各属性整体一次性替换（原子赋值），并发读请求要么看到旧快照、
+        要么看到新快照，不会读到半更新状态。
+        """
         self.basic = self._load_basic()
         self.calendar = self._load_calendar()
         self.indexes: dict[str, pd.DataFrame] = self._load_indexes()
         self.market = self._build_market_daily()
+        self.board_df, self.board_all_df = self._load_board_members()
+        # 市场板块映射（代码前缀推导）：code -> key，以及各板块股票数
+        self._stock_market = {c: market_of(c) for c in self.basic.index}
+        self._market_counts: dict[str, int] = {}
+        for k in self._stock_market.values():
+            if k:
+                self._market_counts[k] = self._market_counts.get(k, 0) + 1
         self.meta = {
             "n_stocks": int(self.basic.shape[0]),
             "date_min": str(self.market.index.min().date()),
@@ -90,8 +125,32 @@ class DataStore:
             "indexes": [
                 {"code": c, "name": INDEX_NAMES.get(c, c)} for c in sorted(self.indexes)
             ],
+            "markets": [
+                {"key": k, "name": name, "n_stocks": self._market_counts.get(k, 0)}
+                for k, name, _p in MARKET_SEGMENTS
+                if self._market_counts.get(k, 0)
+            ],
+            "boards_available": self.board_df is not None,
+            "n_boards": int(self.board_df["board_code"].nunique()) if self.board_df is not None else 0,
+            "concept_boards_available": bool(
+                self.board_all_df is not None and (self.board_all_df["board_type"] == "concept").any()
+            ),
             "load_seconds": round(time.time() - t0, 2),
         }
+
+    def clear_caches(self) -> None:
+        """清空进程内查询缓存（日线数据更新后由调度器 / 手动触发调用）。"""
+        self._rank_cache.clear()
+        self._rank_order.clear()
+        self._chips_cache.clear()
+        self._last_cache.clear()
+        self._daily_cache.clear()
+
+    def reload(self) -> dict:
+        """数据落盘后重载启动数据并清空查询缓存，返回新 meta。"""
+        self.clear_caches()
+        self._load_all(time.time())
+        return self.meta
 
     # ------------------------------------------------------------------ load
 
@@ -106,6 +165,43 @@ class DataStore:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
                 return df
         raise SystemExit(f"{self.root} 下未找到股票基础信息表")
+
+    def _load_board_members(self) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+        """板块成分表（downloader board 生成）；缺失返回 (None, None)（板块功能降级）。
+
+        返回 (行业映射, 全量成分)：
+        - 行业映射 code -> (board_code, board_name)，每股唯一（互斥划分），
+          用于个股表「板块」列；
+        - 全量成分 [board_type, board_code, board_name]（index=code，概念板块成分
+          有重叠、一股多行），用于板块排行与板块筛选。
+        兼容旧文件（无 board_type 列，全部视为 industry）。
+        """
+        p = self.root / "board_members.parquet"
+        if not p.exists():
+            return None, None
+        try:
+            df = pd.read_parquet(p)
+            if "board_type" not in df.columns:
+                df["board_type"] = "industry"
+            ind = df[df["board_type"] == "industry"]
+            ind_map = (
+                ind.drop_duplicates("code").set_index("code")[["board_code", "board_name"]]
+                if len(ind) else None
+            )
+            all_df = df.drop_duplicates(["code", "board_code"]).set_index("code")
+            return ind_map, all_df
+        except Exception:  # noqa: BLE001 文件损坏不阻塞主功能
+            return None, None
+
+    def _board_of(self, code: str) -> tuple[str | None, str | None]:
+        """代码 -> (行业board_code, board_name)；无行业映射返回 (None, None)。
+
+        个股表「板块」列固定展示行业归属（划分、每股唯一；概念成分有重叠不适合做标签列）。
+        """
+        if self.board_df is None or code not in self.board_df.index:
+            return None, None
+        r = self.board_df.loc[code]
+        return str(r["board_code"]), str(r["board_name"])
 
     def _load_calendar(self) -> pd.DatetimeIndex:
         p = self.root / "trade_calendar.parquet"
@@ -170,25 +266,106 @@ class DataStore:
 
     # ----------------------------------------------------------------- query
 
+    # ------------------------------------------------------ 多用户分桶
+
+    def user_dir(self, user: str | None) -> Path:
+        """用户数据目录：None(共享模式) -> 根目录；用户 -> data/users/{user}/。"""
+        if user is None:
+            return self.root
+        return self.root / "users" / user
+
+    def _bucket(self, user: str | None) -> dict:
+        """取（并惰性加载）某用户的自选/交易桶。
+
+        桶 = {wl_path, trades_path, wl_lock, trades_lock, wl_codes, trades}；
+        不同用户互不共享内存状态与文件，实现数据隔离。
+        """
+        with self._buckets_lock:
+            b = self._buckets.get(user)
+            if b is not None:
+                return b
+            base = self.user_dir(user)
+            b = {
+                "user": user,
+                "wl_path": base / "watchlist.json",
+                "trades_path": base / "trades.json",
+                "wl_lock": threading.Lock(),
+                "trades_lock": threading.Lock(),
+                "wl_codes": self._load_watchlist_file(base / "watchlist.json"),
+                "trades": self._load_trades_file(base / "trades.json"),
+            }
+            self._buckets[user] = b
+            return b
+
+    def drop_bucket(self, user: str | None) -> None:
+        """丢弃某用户的内存桶（legacy 迁移/文件被外部改动后强制重读）。"""
+        with self._buckets_lock:
+            self._buckets.pop(user, None)
+
+    def known_users(self) -> list[str]:
+        """data/users/ 下已存在数据目录的用户名（按名称排序）。"""
+        d = self.root / "users"
+        if not d.is_dir():
+            return []
+        return sorted(p.name for p in d.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+    def watchlist_codes_all(self) -> list[str]:
+        """全部用户自选股并集（去重、首现顺序）——分钟线后台同步 / 盘后更新视角。"""
+        from .auth import all_watchlist_codes
+
+        return all_watchlist_codes(self.root)
+
+    @property
+    def _wl_codes(self) -> list[str]:
+        """兼容旧调用（EodUpdater 等后台任务）：返回全部用户自选并集。"""
+        return self.watchlist_codes_all()
+
+    def migrate_legacy_to(self, user: str) -> list[str]:
+        """首个用户注册时，把根级 legacy 数据文件迁入该用户目录。
+
+        迁移 watchlist.json / trades.json / notifications.jsonl（存在才迁；
+        目标已存在则跳过不覆盖）。返回实际迁移的文件名列表。
+        """
+        moved: list[str] = []
+        for name in ("watchlist.json", "trades.json", "notifications.jsonl"):
+            src = self.root / name
+            if not src.is_file():
+                continue
+            dst_dir = self.root / "users" / user
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            dst = dst_dir / name
+            if dst.is_file():
+                continue
+            os.replace(src, dst)
+            moved.append(name)
+        if moved:
+            self.drop_bucket(None)
+            self.drop_bucket(user)
+        return moved
+
     # ------------------------------------------------------------ watchlist
 
-    def _load_watchlist(self) -> list[str]:
+    @staticmethod
+    def _load_watchlist_file(path: Path) -> list[str]:
         try:
-            data = json.loads(self._wl_path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
             codes = data.get("codes", [])
             return [c for c in codes if re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", str(c))]
-        except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        except (FileNotFoundError, json.JSONDecodeError, TypeError, OSError):
             return []
 
-    def _save_watchlist(self) -> None:
+    def _save_watchlist(self, user: str | None) -> None:
+        b = self._bucket(user)
+        path = b["wl_path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = tempfile.NamedTemporaryFile(
-            "w", dir=self._wl_path.parent, suffix=".tmp", delete=False, encoding="utf-8"
+            "w", dir=path.parent, suffix=".tmp", delete=False, encoding="utf-8"
         )
         try:
-            json.dump({"codes": self._wl_codes, "updated": time.strftime("%Y-%m-%d %H:%M:%S")},
+            json.dump({"codes": b["wl_codes"], "updated": time.strftime("%Y-%m-%d %H:%M:%S")},
                       tmp, ensure_ascii=False, indent=2)
             tmp.close()
-            os.replace(tmp.name, self._wl_path)
+            os.replace(tmp.name, path)
         except BaseException:
             tmp.close()
             try:
@@ -197,10 +374,11 @@ class DataStore:
                 pass
             raise
 
-    def watchlist(self) -> list[dict]:
+    def watchlist(self, user: str | None) -> list[dict]:
         """自选股列表（含基础信息），按加入顺序。"""
+        b = self._bucket(user)
         out = []
-        for code in self._wl_codes:
+        for code in b["wl_codes"]:
             if code in self.basic.index:
                 r = self.basic.loc[code]
                 lb = self.hfq_last(code)
@@ -216,11 +394,12 @@ class DataStore:
                     "minute_bars": m["bars"] if m else None,
                     "minute_last": m["last"] if m else None,
                     "fund": self.fund_latest(code),
+                    "info": self.stock_info(code),
                 })
         return out
 
     def fund_latest(self, code: str) -> dict | None:
-        """最新报告期财报摘要（仅读本地缓存，不发网络请求；无缓存返回 None）。"""
+        """最新报告期财报完整摘要（仅读本地缓存，不发网络请求；无缓存返回 None）。"""
         code = code.upper()
         f = self.root / "fundamental" / f"{code}.parquet"
         if not f.exists():
@@ -251,9 +430,84 @@ class DataStore:
             "rev_yoy": g("rev_yoy"),
             "net_profit": g("net_profit"),
             "net_profit_yoy": g("net_profit_yoy"),
+            "kdj_profit": g("kdj_profit"),
+            "kdj_profit_yoy": g("kdj_profit_yoy"),
+            "eps": g("eps"),
             "roe": g("roe"),
+            "gross_margin": g("gross_margin"),
+            "net_margin": g("net_margin"),
             "debt_ratio": g("debt_ratio"),
         }
+
+    def stock_info(self, code: str) -> dict | None:
+        """个股信息（仅本地数据）：流通市值/换手率/52周高低/年初至今/一年涨跌幅。
+
+        价格类指标统一折算为真实价单位（与 kline 同口径）。
+        """
+        code = code.upper()
+        if code not in self.basic.index:
+            return None
+        r = self.basic.loc[code]
+        info = {
+            "float_mv": _r(r.get("float_mv")),
+            "turnover": _pct(r.get("turnover")),  # 数据源百分数 -> 小数
+            "week52_high": None,
+            "week52_low": None,
+            "ytd_chg": None,
+            "y1y_chg": None,
+        }
+        df = self._daily(code)
+        if df is None or df.empty:
+            return info
+        real = _r(r.get("latest_price"))
+        hfq_last = _r(df["close"].iloc[-1])
+        factor = real / hfq_last if (real is not None and hfq_last) else None
+        closes = df["close"].astype(float)
+        highs = df["high"].astype(float) if "high" in df else closes
+        lows = df["low"].astype(float) if "low" in df else closes
+        if factor:
+            closes, highs, lows = closes * factor, highs * factor, lows * factor
+        last_close = closes.iloc[-1]
+        if len(df):
+            info["week52_high"] = _r(highs.tail(244).max())
+            info["week52_low"] = _r(lows.tail(244).min())
+        # 年初至今：以上一年最后一个交易日收盘为基准
+        this_year = int(df["date"].dt.year.max())
+        prev = df[df["date"].dt.year == this_year - 1]
+        if len(prev):
+            base = _r(closes.loc[prev.index[-1]])
+            if base:
+                info["ytd_chg"] = _r(last_close / base - 1.0)
+        if len(df) > 245:
+            info["y1y_chg"] = _r(last_close / closes.iloc[-245] - 1.0)
+        return info
+
+    def _daily(self, code: str) -> pd.DataFrame | None:
+        """个股日线 (date/high/low/close)，带小缓存；无数据返回 None。"""
+        code = code.upper()
+        if code in self._daily_cache:
+            return self._daily_cache[code]
+        f = self.daily_dir / f"{code}.parquet"
+        df = None
+        if f.exists():
+            try:
+                cols = [c for c in ("date", "high", "low", "close")
+                        if c in pd.read_parquet(f).columns]
+                df = pd.read_parquet(f, columns=cols)
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.sort_values("date")
+            except Exception:  # noqa: BLE001
+                df = None
+        self._daily_cache[code] = df
+        if len(self._daily_cache) > 64:
+            self._daily_cache.pop(next(iter(self._daily_cache)), None)
+        return df
+
+    def valuation(self, code: str, refresh: bool = False) -> dict:
+        """个股估值 PE(TTM)/PE(静)/PB/PEG/PS（东财估值分析，本地缓存 30 分钟）。"""
+        from .valuation import fetch
+
+        return fetch(code, self.root, refresh=refresh)
 
     def news(self, code: str, refresh: bool = False) -> dict:
         """个股最新新闻（本地缓存优先，TTL 30 分钟；失败回退旧缓存，见 news.py）。"""
@@ -261,36 +515,74 @@ class DataStore:
 
         return fetch(code, self.root, refresh=refresh)
 
-    def watchlist_add(self, code: str) -> tuple[list[str], bool]:
+    def watchlist_codes(self, user: str | None) -> list[str]:
+        """某用户的自选股代码列表（按加入顺序）。"""
+        b = self._bucket(user)
+        with b["wl_lock"]:
+            return list(b["wl_codes"])
+
+    def watchlist_add(self, user: str | None, code: str) -> tuple[list[str], bool]:
         code = code.upper()
         if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
             raise ValueError(f"代码格式错误: {code}")
-        with self._wl_lock:
+        b = self._bucket(user)
+        with b["wl_lock"]:
             added = False
-            if code not in self._wl_codes:
-                if len(self._wl_codes) >= 300:
+            if code not in b["wl_codes"]:
+                if len(b["wl_codes"]) >= 300:
                     raise ValueError("自选股上限 300 只")
-                self._wl_codes.append(code)
+                b["wl_codes"].append(code)
                 added = True
-            self._save_watchlist()
-            return list(self._wl_codes), added
+            self._save_watchlist(user)
+            return list(b["wl_codes"]), added
 
-    def watchlist_remove(self, code: str) -> tuple[list[str], bool]:
+    def watchlist_remove(self, user: str | None, code: str) -> tuple[list[str], bool]:
         code = code.upper()
-        with self._wl_lock:
-            removed = code in self._wl_codes
-            self._wl_codes = [c for c in self._wl_codes if c != code]
-            self._save_watchlist()
-            return list(self._wl_codes), removed
+        b = self._bucket(user)
+        with b["wl_lock"]:
+            removed = code in b["wl_codes"]
+            b["wl_codes"] = [c for c in b["wl_codes"] if c != code]
+            self._save_watchlist(user)
+            return list(b["wl_codes"]), removed
+
+    def watchlist_reorder(self, user: str | None, codes: list[str]) -> list[str]:
+        """按给定顺序重排自选股（网页拖拽）。
+
+        - 只接受当前已在自选中的代码（未知/已退市代码忽略），重复去重；
+        - 未列出的自选股按原相对顺序追加在末尾，保证不丢股；
+        """
+        b = self._bucket(user)
+        with b["wl_lock"]:
+            cur = list(b["wl_codes"])
+            cur_set = set(cur)
+            new: list[str] = []
+            for c in codes:
+                c = str(c).upper()
+                if c in cur_set and c not in new:
+                    new.append(c)
+            for c in cur:
+                if c not in new:
+                    new.append(c)
+            b["wl_codes"] = new
+            self._save_watchlist(user)
+            return list(b["wl_codes"])
+
+    def watchlist_clear(self, user: str | None) -> list[str]:
+        """清空某用户的全部自选股。"""
+        b = self._bucket(user)
+        with b["wl_lock"]:
+            b["wl_codes"] = []
+            self._save_watchlist(user)
+            return []
 
     # ------------------------------------------------------------- trades
     # 自选股买卖流水：手工登记（date/side/price/shares/note），持久化到
     # data/trades.json，网页 K 线上以 ▲买 / ▼卖 标记展示，并据此计算持仓成本。
 
-    def _load_trades(self) -> list[dict]:
+    def _load_trades_file(self, path: Path) -> list[dict]:
         try:
-            data = json.loads(self._trades_path.read_text())
-        except (FileNotFoundError, json.JSONDecodeError, TypeError):
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, TypeError, OSError):
             return []
         trades = []
         for t in data.get("trades", []):
@@ -326,15 +618,18 @@ class DataStore:
             })
         return sorted(trades, key=lambda t: (t["date"], t["created"]))
 
-    def _save_trades(self) -> None:
+    def _save_trades(self, user: str | None) -> None:
+        b = self._bucket(user)
+        path = b["trades_path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = tempfile.NamedTemporaryFile(
-            "w", dir=self._trades_path.parent, suffix=".tmp", delete=False, encoding="utf-8"
+            "w", dir=path.parent, suffix=".tmp", delete=False, encoding="utf-8"
         )
         try:
-            json.dump({"trades": self._trades, "updated": time.strftime("%Y-%m-%d %H:%M:%S")},
+            json.dump({"trades": b["trades"], "updated": time.strftime("%Y-%m-%d %H:%M:%S")},
                       tmp, ensure_ascii=False, indent=1)
             tmp.close()
-            os.replace(tmp.name, self._trades_path)
+            os.replace(tmp.name, path)
         except BaseException:
             tmp.close()
             try:
@@ -343,10 +638,11 @@ class DataStore:
                 pass
             raise
 
-    def trades(self, code: str | None = None) -> list[dict]:
-        """交易流水（按日期+登记时间升序）；code 为空时返回全部。"""
-        with self._trades_lock:
-            ts = [dict(t) for t in self._trades]
+    def trades(self, user: str | None, code: str | None = None) -> list[dict]:
+        """某用户的交易流水（按日期+登记时间升序）；code 为空时返回该用户全部。"""
+        b = self._bucket(user)
+        with b["trades_lock"]:
+            ts = [dict(t) for t in b["trades"]]
         if code:
             code = code.upper()
             ts = [t for t in ts if t["code"] == code]
@@ -409,6 +705,7 @@ class DataStore:
 
     def trade_add(
         self,
+        user: str | None,
         code: str,
         date: str,
         side: str,
@@ -423,18 +720,19 @@ class DataStore:
         date, side, price, shares, note, fee = self._validate_trade_fields(
             date, side, price, shares, note, fee
         )
-
-        with self._trades_lock:
-            if len(self._trades) >= _MAX_TRADES:
+        b = self._bucket(user)
+        with b["trades_lock"]:
+            if len(b["trades"]) >= _MAX_TRADES:
                 raise ValueError(f"交易记录上限 {_MAX_TRADES} 笔")
             rec = self._make_trade_rec(code, date, side, price, shares, note, fee)
-            self._trades.append(rec)
-            self._trades.sort(key=lambda t: (t["date"], t["created"]))
-            self._save_trades()
-            return [dict(t) for t in self._trades], dict(rec)
+            b["trades"].append(rec)
+            b["trades"].sort(key=lambda t: (t["date"], t["created"]))
+            self._save_trades(user)
+            return [dict(t) for t in b["trades"]], dict(rec)
 
     def trade_add_batch(
         self,
+        user: str | None,
         code: str,
         items: list[dict],
     ) -> tuple[list[dict], list[dict], list[dict]]:
@@ -454,9 +752,10 @@ class DataStore:
         if len(items) > _MAX_BATCH:
             raise ValueError(f"单次批量最多 {_MAX_BATCH} 条")
 
+        b = self._bucket(user)
         added: list[dict] = []
         errors: list[dict] = []
-        with self._trades_lock:
+        with b["trades_lock"]:
             for i, it in enumerate(items):
                 if not isinstance(it, dict):
                     errors.append({"index": i, "raw": str(it), "error": "记录应为对象"})
@@ -470,29 +769,31 @@ class DataStore:
                 except ValueError as e:
                     errors.append({"index": i, "raw": raw, "error": str(e)})
                     continue
-                if len(self._trades) + len(added) >= _MAX_TRADES:
+                if len(b["trades"]) + len(added) >= _MAX_TRADES:
                     errors.append({"index": i, "raw": raw, "error": f"交易记录上限 {_MAX_TRADES} 笔"})
                     continue
                 added.append(self._make_trade_rec(code, date, side, price, shares, note, fee))
             if added:
-                self._trades.extend(added)
-                self._trades.sort(key=lambda t: (t["date"], t["created"]))
-                self._save_trades()
-        return [dict(t) for t in self._trades], [dict(r) for r in added], errors
+                b["trades"].extend(added)
+                b["trades"].sort(key=lambda t: (t["date"], t["created"]))
+                self._save_trades(user)
+        return [dict(t) for t in b["trades"]], [dict(r) for r in added], errors
 
-    def trade_remove(self, code: str, tid: str) -> tuple[list[dict], bool]:
+    def trade_remove(self, user: str | None, code: str, tid: str) -> tuple[list[dict], bool]:
         code = (code or "").strip().upper()
         tid = str(tid or "")
-        with self._trades_lock:
-            before = len(self._trades)
-            self._trades = [t for t in self._trades if not (t["id"] == tid and t["code"] == code)]
-            removed = len(self._trades) < before
+        b = self._bucket(user)
+        with b["trades_lock"]:
+            before = len(b["trades"])
+            b["trades"] = [t for t in b["trades"] if not (t["id"] == tid and t["code"] == code)]
+            removed = len(b["trades"]) < before
             if removed:
-                self._save_trades()
-            return [dict(t) for t in self._trades], removed
+                self._save_trades(user)
+            return [dict(t) for t in b["trades"]], removed
 
     def trade_update(
         self,
+        user: str | None,
         code: str,
         tid: str,
         date: str | None = None,
@@ -547,8 +848,9 @@ class DataStore:
                     raise ValueError("费用应为非负数")
                 new_fee = round(f, 2)
 
-        with self._trades_lock:
-            rec = next((t for t in self._trades if t["id"] == tid and t["code"] == code), None)
+        b = self._bucket(user)
+        with b["trades_lock"]:
+            rec = next((t for t in b["trades"] if t["id"] == tid and t["code"] == code), None)
             if rec is None:
                 raise ValueError("未找到该交易记录")
             if new_date is not None:
@@ -563,9 +865,9 @@ class DataStore:
                 rec["note"] = new_note
             if fee is not _UNSET:
                 rec["fee"] = new_fee
-            self._trades.sort(key=lambda t: (t["date"], t["created"]))
-            self._save_trades()
-            return [dict(t) for t in self._trades], dict(rec)
+            b["trades"].sort(key=lambda t: (t["date"], t["created"]))
+            self._save_trades(user)
+            return [dict(t) for t in b["trades"]], dict(rec)
 
     @staticmethod
     def position_of(ts: list[dict], last_price: float | None = None) -> dict:
@@ -590,10 +892,10 @@ class DataStore:
             "n_trades": len(ts),
         }
 
-    def positions(self) -> dict[str, dict]:
-        """按代码汇总的持仓（最新价取基础信息表快照；无交易记录的代码不出现在结果中）。"""
+    def positions(self, user: str | None) -> dict[str, dict]:
+        """某用户按代码汇总的持仓（最新价取基础信息表快照；无交易记录的代码不出现）。"""
         by_code: dict[str, list[dict]] = {}
-        for t in self.trades():
+        for t in self.trades(user):
             by_code.setdefault(t["code"], []).append(t)
         out = {}
         for code, lst in by_code.items():
@@ -713,17 +1015,8 @@ class DataStore:
             out["indexes"][code] = {"name": INDEX_NAMES.get(code, code), "close": _f(_nanlist(close))}
         return out
 
-    def rank(
-        self,
-        start: str,
-        end: str,
-        metric: str = "ret",
-        n: int = 30,
-        ascending: bool = False,
-    ) -> dict:
-        """区间横截面排行：ret 区间收益 / vol 年化波动 / maxdd 最大回撤 / turnover 平均换手。"""
-        if metric not in _RANK_METRICS:
-            metric = "ret"
+    def _rank_table(self, start: str, end: str) -> pd.DataFrame:
+        """逐股区间统计表（带 LRU 缓存），个股/板块排行共用。"""
         key = (start, end)
         table = self._rank_cache.get(key)
         if table is None:
@@ -732,19 +1025,53 @@ class DataStore:
             self._rank_order.append(key)
             if len(self._rank_order) > _RANK_CACHE_MAX:
                 self._rank_cache.pop(self._rank_order.pop(0), None)
+        return table
 
-        # 区间内交易日数（作为最低样本量）
-        cal = self.calendar
-        n_days = int(((cal >= pd.Timestamp(start)) & (cal <= pd.Timestamp(end))).sum())
-        need = max(5, min(20, n_days))
+    @staticmethod
+    def _need_days(start: str, end: str, calendar: pd.DatetimeIndex) -> tuple[int, int]:
+        """区间内交易日数 + 最低样本量（5~20 之间取区间长度的比例下限）。"""
+        n_days = int(((calendar >= pd.Timestamp(start)) & (calendar <= pd.Timestamp(end))).sum())
+        return n_days, max(5, min(20, n_days))
+
+    def rank(
+        self,
+        start: str,
+        end: str,
+        metric: str = "ret",
+        n: int = 30,
+        ascending: bool = False,
+        board: str | None = None,
+        market: str | None = None,
+    ) -> dict:
+        """个股区间横截面排行：ret 区间收益 / vol 年化波动 / maxdd 最大回撤 / turnover 平均换手。
+
+        board: 板块代码（BKxxxx）过滤，仅返回该板块成分股（行业/概念板块均可）。
+        market: 市场板块 key（sh_main/sz_main/cyb/kcb/bj）过滤。
+        """
+        if metric not in _RANK_METRICS:
+            metric = "ret"
+        table = self._rank_table(start, end)
+
+        n_days, need = self._need_days(start, end, self.calendar)
         t = table[table["n_days"] >= need].copy()
+        if board:
+            if self.board_all_df is None:
+                t = t.iloc[0:0]
+            else:
+                in_board = self.board_all_df.index[self.board_all_df["board_code"] == board]
+                t = t.loc[t.index.intersection(in_board)]
+        if market:
+            t = t.loc[[c for c in t.index if self._stock_market.get(c) == market]]
         t = t.sort_values(metric, ascending=ascending).head(int(n))
         rows = []
         for code, r in t.iterrows():
+            bc, bn = self._board_of(code)
             rows.append(
                 {
                     "code": code,
                     "name": str(r["name"]),
+                    "board_code": bc,
+                    "board_name": bn,
                     "ret": _r(r["ret"]),
                     "vol": _r(r["vol"]),
                     "maxdd": _r(r["maxdd"]),
@@ -754,6 +1081,104 @@ class DataStore:
                 }
             )
         return {"start": start, "end": end, "metric": metric, "n_days": n_days, "rows": rows}
+
+    def _board_members_of(self, board_type: str) -> pd.DataFrame | None:
+        """指定类型（industry/concept）的板块成分表；该类型无数据返回 None。"""
+        if self.board_all_df is None:
+            return None
+        df = self.board_all_df[self.board_all_df["board_type"] == board_type]
+        return df if len(df) else None
+
+    def boards(self, board_type: str = "industry") -> list[dict]:
+        """板块列表（含成分股数，按板块代码排序）。board_type: industry | concept。"""
+        df = self._board_members_of(board_type)
+        if df is None:
+            return []
+        g = df.groupby("board_code").agg(
+            board_name=("board_name", "first"),
+            n_stocks=("board_code", "size"),
+        )
+        return [
+            {"board_code": str(bc), "board_name": str(r["board_name"]), "n_stocks": int(r["n_stocks"])}
+            for bc, r in g.iterrows()
+        ]
+
+    def board_rank(
+        self,
+        start: str,
+        end: str,
+        metric: str = "ret",
+        n: int = 30,
+        ascending: bool = False,
+        min_stocks: int = 5,
+        board_type: str = "industry",
+    ) -> dict:
+        """板块区间横截面排行：成分股等权聚合（板块涨跌幅=成分股区间收益均值，
+        波动/回撤/换手取成分股均值，涨跌家数按区间收益正负统计）。
+
+        board_type: industry 行业板块（划分）| concept 概念板块（成分有重叠，
+        同一只股票计入多个概念，跨概念汇总无加总意义）。
+        min_stocks: 成分股（满足最低样本量）数下限，过滤过小板块的统计噪声。
+        """
+        if metric not in _RANK_METRICS:
+            metric = "ret"
+        members = self._board_members_of(board_type)
+        if members is None:
+            cmd = "python -m downloader board"
+            if board_type == "concept":
+                cmd = "python -m downloader board --with-concept（需东财接口可用）"
+            return {
+                "start": start, "end": end, "metric": metric,
+                "error": f"无{'概念' if board_type == 'concept' else '行业'}板块数据，请先运行: {cmd}",
+                "rows": [],
+            }
+        table = self._rank_table(start, end)
+
+        n_days, need = self._need_days(start, end, self.calendar)
+        t = table[table["n_days"] >= need].copy()
+        # 概念板块成分有重叠：按 (code, board_code) 展开，再按板块聚合
+        t = t.join(members[["board_code"]].rename(columns={"board_code": "_bc"}), how="inner")
+        t = t.dropna(subset=["_bc"])
+        t["board_code"] = t["_bc"]
+        t = t.drop(columns=["_bc"]).copy()
+        t["adv"] = (t["ret"] > 0).astype(float)
+        t["dec"] = (t["ret"] < 0).astype(float)
+
+        grp = t.groupby("board_code")
+        agg = pd.DataFrame(
+            {
+                "ret": grp["ret"].mean(),
+                "vol": grp["vol"].mean(),
+                "maxdd": grp["maxdd"].mean(),
+                "turnover": grp["turnover"].mean(),
+                "total_mv": grp["total_mv"].sum(),
+                "n_stocks": grp.size(),
+                "adv": grp["adv"].sum(),
+                "dec": grp["dec"].sum(),
+            }
+        )
+        n_boards = int(len(agg))
+        agg = agg[agg["n_stocks"] >= int(min_stocks)]
+        agg = agg.sort_values(metric, ascending=ascending).head(int(n))
+        names = members.groupby("board_code")["board_name"].first()
+        rows = []
+        for bc, r in agg.iterrows():
+            rows.append(
+                {
+                    "board_code": str(bc),
+                    "board_name": str(names.get(bc, bc)),
+                    "ret": _r(r["ret"]),
+                    "vol": _r(r["vol"]),
+                    "maxdd": _r(r["maxdd"]),
+                    "turnover": _r(r["turnover"]),
+                    "adv": int(r["adv"]),
+                    "dec": int(r["dec"]),
+                    "n_stocks": int(r["n_stocks"]),
+                    "total_mv": _r(r["total_mv"]),
+                }
+            )
+        return {"start": start, "end": end, "metric": metric, "n_days": n_days,
+                "n_boards": n_boards, "rows": rows}
 
     def _compute_rank_table(self, start: str, end: str) -> pd.DataFrame:
         """扫描区间（前扩 45 天取首日基准收益）内的逐股区间统计。

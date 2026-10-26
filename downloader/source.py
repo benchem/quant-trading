@@ -48,6 +48,12 @@ _EM_LIST_MAP = {
     "f12": "code_raw", "f14": "name", "f2": "latest_price",
     "f3": "pct_chg", "f8": "turnover", "f20": "total_mv", "f21": "float_mv",
 }
+# 板块列表（东财行情中心「板块」页）:
+#   行业板块 m:90 t:2（细粒度行业分类 ~496 个，划分：每只A股恰好归属一个）
+#   概念板块 m:90 t:3（题材/风格标签 ~500 个，动态增减，成分有重叠：一股可属多个）
+#   地域板块 m:90 t:1（~38 个，按注册地）
+# 行业/概念共用 BK 代码空间，成分股列表均为 b:BKxxxx
+_EM_BOARD_LIST_FS = {"industry": "m:90 t:2", "concept": "m:90 t:3", "region": "m:90 t:1"}
 
 # ------------------------------------------------------------ 腾讯
 # K线同一 API 有多个主机；WAF 限流/拦截按主机区分，因此多主机自动切换:
@@ -367,6 +373,123 @@ def _em_stock_list() -> pd.DataFrame:
     return out.sort_values("code").reset_index(drop=True)
 
 
+def _em_clist_page(fs: str, fields: str, page: int, pz: int = 200) -> tuple[int, list]:
+    """东财 clist 通用分页：返回 (total, 本页 diff 列表)。"""
+    params = {
+        "pn": str(page), "pz": str(pz), "po": "1", "np": "1",
+        "ut": _EM_UT_CLIST, "fltt": "2", "invt": "2", "fid": "f12",
+        "fs": fs, "fields": fields,
+    }
+    data = _client.get_json(_EM_CLIST_URL, params)
+    d = data.get("data") or {}
+    if not d:
+        raise FetchError(f"东财列表返回空 (fs={fs})")
+    return (d.get("total") or 0), (d.get("diff") or [])
+
+
+def _em_board_list(board_type: str = "industry") -> pd.DataFrame:
+    """东财板块列表（行业约 496 个细粒度行业 / 概念约 500 个题材标签 / 地域约 38 个）。"""
+    fs = _EM_BOARD_LIST_FS.get(board_type)
+    if not fs:
+        raise FetchError(f"未知板块类型: {board_type}")
+    rows, page = [], 1
+    while True:
+        total, diff = _em_clist_page(fs, "f12,f14", page)
+        if not diff:
+            break
+        rows.extend({"board_code": str(it["f12"]), "board_name": str(it["f14"])} for it in diff)
+        if len(rows) >= total or page > 60:
+            break
+        page += 1
+    if not rows:
+        raise FetchError(f"东财{'概念' if board_type == 'concept' else '行业'}板块列表为空")
+    out = pd.DataFrame(rows).drop_duplicates("board_code")
+    return out.sort_values("board_code").reset_index(drop=True)
+
+
+def _em_board_members(board_code: str) -> list[str]:
+    """单个板块的全部成分股（原始 6 位代码）。"""
+    rows, page = [], 1
+    while True:
+        total, diff = _em_clist_page(f"b:{board_code}", "f12", page)
+        if not diff:
+            break
+        rows.extend(str(it["f12"]) for it in diff)
+        if len(rows) >= total or page > 50:
+            break
+        page += 1
+    return rows
+
+
+def fetch_board_members(
+    valid_codes: set[str] | None = None, board_type: str = "industry"
+) -> tuple[pd.DataFrame, list[str]]:
+    """板块成分表 [code, board_type, board_code, board_name]。
+
+    board_type: industry 行业板块（东财约 496 个细粒度行业；东财板块列表不可用时
+    降级 baostock 证监会行业分类，约 84 个行业，board_code 为行业代码+名称，
+    口径更粗，东财恢复后重跑可换回）| concept 概念板块（东财约 500 个题材/风格
+    标签，成分有重叠，仅东财源，无兜底）。
+    valid_codes: 股票列表代码集合（Wind 风格），提供时剔除已退市代码
+    （baostock 行业表含历史退市股，东财成分表天然为在市股票）。
+
+    东财路径逐板块拉成分（每类约 500 次请求，受全局限速约束，默认约 2 分钟/类）；
+    单板块失败（含一次即时重试）不中断整体：计入返回的失败列表，
+    由调用方保留旧缓存对应板块、重跑同一命令自动补齐。
+    数据源不可用、或过半板块失败时抛错。
+    """
+    if board_type == "industry":
+        try:
+            boards = _em_board_list("industry")
+        except Exception as e:  # noqa: BLE001 东财不可用 -> baostock 行业分类兜底
+            print(f"[source] 东财行业板块不可用（{str(e)[:80]}），降级 baostock 证监会行业分类"
+                  "（口径更粗，东财恢复后重跑本命令可换回细粒度行业）", flush=True)
+            return _bs_board_members(valid_codes)
+        return _fetch_board_members_em(valid_codes, "industry", boards)
+    return _fetch_board_members_em(valid_codes, board_type)
+
+
+def _fetch_board_members_em(
+    valid_codes: set[str] | None, board_type: str = "industry", boards: pd.DataFrame | None = None
+) -> tuple[pd.DataFrame, list[str]]:
+    """东财板块成分（行业=划分每股一行；概念=有重叠每股每板块一行）。"""
+    if boards is None:
+        boards = _em_board_list(board_type)
+    rows: list[dict] = []
+    failed: list[str] = []
+    for _, b in boards.iterrows():
+        codes_raw: list[str] = []
+        for attempt in range(2):
+            try:
+                codes_raw = _em_board_members(b["board_code"])
+                break
+            except Exception:  # noqa: BLE001 单板块失败不中断整体
+                if attempt == 1:
+                    failed.append(str(b["board_code"]))
+        for c in codes_raw:
+            try:
+                rows.append({
+                    "code": codes.to_wind_code(c),
+                    "board_type": board_type,
+                    "board_code": str(b["board_code"]),
+                    "board_name": str(b["board_name"]),
+                })
+            except ValueError:
+                continue  # 极少量非A股代码（如 B 股）直接跳过
+    if len(failed) > len(boards) // 2:
+        raise FetchError(f"板块成分抓取大面积失败（{len(failed)}/{len(boards)} 个板块），请稍后重跑")
+    if not rows:
+        raise FetchError("板块成分列表为空")
+    # 行业为划分（每股唯一板块，按 code 去重）；概念有重叠（按 code+board_code 去重）
+    dedup = "code" if board_type == "industry" else ["code", "board_code"]
+    out = pd.DataFrame(rows).drop_duplicates(dedup, keep="first")
+    if valid_codes:
+        out = out[out["code"].isin(valid_codes)]
+        if out.empty:
+            raise FetchError("板块成分表过滤后为空（股票列表与成分表不匹配？）")
+    return out.sort_values(["code", "board_code"]).reset_index(drop=True), failed
+
+
 # ============================================================ 腾讯
 def _tx_symbol(wind_code: str) -> str:
     num, mkt = wind_code.split(".")
@@ -385,7 +508,16 @@ def _tx_kline_page(sym: str, fq: str, start_dt: dt.date, end_dt: dt.date) -> lis
             data = _client.get_json(_TX_KLINE_URLS[idx], params)
             _tx_kline_url_idx[0] = idx
             d = (data.get("data") or {}).get(sym) or {}
-            return d.get(key) or d.get("day") or []
+            rows = d.get(key)
+            if rows:
+                return rows
+            # ⚠️ 复权键缺失时绝不能退回 d["day"]（不复权原始价）。
+            # 2026-10-25 事故: 对无交易日窗口(如周五收盘后取 周六~周日)腾讯会回退
+            # 返回最新一根【未复权】bar，曾静默混入 hfq 序列导致末根单位断裂、
+            # 前复权折算因子归 1，全市场图表价格整体错位。此时应报错走兜底源。
+            if fq and d.get("day"):
+                raise FetchError(f"腾讯返回缺失 {key} 键(复权数据不可用): {sym}")
+            return []
         except Exception as e:  # noqa: BLE001
             last_err = e
     raise FetchError(f"腾讯K线全部主机失败 (symbol={sym}): {last_err}")
@@ -396,6 +528,7 @@ def _tx_klines(wind_code: str, start: str, end: str, adjust: str) -> list[list]:
     sym = _tx_symbol(wind_code)
     fq = _TX_FQ.get(adjust, "hfq")
     start_dt, cur_end_dt = _d(start), _d(end)
+    end_dt = cur_end_dt  # 原始请求区间上界（cur_end_dt 会随翻页前移）
     rows: list[list] = []
     for _ in range(60):  # 安全上限 ~60*640 个交易日
         k = _tx_kline_page(sym, fq, start_dt, cur_end_dt)
@@ -410,7 +543,9 @@ def _tx_klines(wind_code: str, start: str, end: str, adjust: str) -> list[list]:
         cur_end_dt = oldest - dt.timedelta(days=1)
         if cur_end_dt < start_dt:
             break
-    return rows
+    # 腾讯对无交易日窗口会「回退」返回最新数据（可能早于请求起点），统一裁剪到区间内
+    lo, hi = str(start_dt), str(end_dt)
+    return [r for r in rows if lo <= str(r[0])[:10] <= hi]
 
 
 def _tx_klines_to_df(rows: list[list], wind_code: str) -> pd.DataFrame:
@@ -604,6 +739,45 @@ def _bs_trade_dates() -> pd.Series:
     if not dates:
         raise FetchError("baostock 交易日历为空")
     return pd.Series(pd.to_datetime(dates))
+
+
+def _bs_board_members(valid_codes: set[str] | None) -> tuple[pd.DataFrame, list[str]]:
+    """baostock 证监会行业分类（东财板块兜底）：code -> 行业。
+
+    返回与东财路径同构的 [code, board_code, board_name]：
+    board_code = 行业代码+名称（如 "J66货币金融服务"），board_name = 行业名（如 "货币金融服务"）。
+    行业表含历史退市股：valid_codes 提供时仅保留在市股票；仅覆盖沪深（北交所无行业，自然缺失）。
+    """
+    import baostock as bs
+
+    with _BS_LOCK:
+        _bs_ensure_login()
+        rs = bs.query_stock_industry()
+        if rs.error_code != "0":
+            raise FetchError(f"baostock 行业分类查询失败: {rs.error_msg}")
+        fields = list(rs.fields)
+        rows: list[list] = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+    if not rows:
+        raise FetchError("baostock 行业分类为空")
+    df = pd.DataFrame(rows, columns=fields)
+    df = df[df["industry"].astype(str).str.strip() != ""]
+    out = []
+    for _, r in df.iterrows():
+        ind = str(r["industry"]).strip()
+        name = ind.split(" ", 1)[1].strip() if " " in ind else ind
+        try:
+            code = codes.to_wind_code(str(r["code"]).replace(".", ""))
+        except ValueError:
+            continue
+        if valid_codes and code not in valid_codes:
+            continue
+        out.append({"code": code, "board_type": "industry", "board_code": ind, "board_name": name})
+    if not out:
+        raise FetchError("baostock 行业分类过滤后为空")
+    res = pd.DataFrame(out).drop_duplicates("code", keep="first")
+    return res.sort_values("code").reset_index(drop=True), []
 
 
 # ============================================================ 对外接口

@@ -123,8 +123,8 @@ def t_position_math():
 def t_store_roundtrip():
     with tempfile.TemporaryDirectory() as td:
         store = _make_store(Path(td))
-        assert store.trades() == []
-        assert store.trades("600000.SH") == []
+        assert store.trades(None) == []
+        assert store.trades(None, "600000.SH") == []
 
         # 校验
         bad = [
@@ -137,81 +137,81 @@ def t_store_roundtrip():
         ]
         for args in bad:
             try:
-                store.trade_add(*args)
+                store.trade_add(None, *args)
                 raise AssertionError(f"应当报错: {args}")
             except ValueError:
                 pass
-        assert store.trades() == [], "校验失败的记录不应落盘"
+        assert store.trades(None) == [], "校验失败的记录不应落盘"
 
         # 正常添加
-        ts, r1 = store.trade_add("600000.SH", "2026-10-20", "buy", 10.05, 100, "首仓")
-        ts, r2 = store.trade_add("600000.SH", "2026-10-22", "sell", 11.0, 50, "减仓")
+        ts, r1 = store.trade_add(None, "600000.SH", "2026-10-20", "buy", 10.05, 100, "首仓")
+        ts, r2 = store.trade_add(None, "600000.SH", "2026-10-22", "sell", 11.0, 50, "减仓")
         assert len(ts) == 2 and r1["code"] == "600000.SH" and r2["side"] == "sell"
         assert r1["id"] and r2["id"] and r1["id"] != r2["id"]
         # 排序
-        assert [t["date"] for t in store.trades()] == ["2026-10-20", "2026-10-22"]
+        assert [t["date"] for t in store.trades(None)] == ["2026-10-20", "2026-10-22"]
         # 过滤
-        assert len(store.trades("600000.SH")) == 2
-        assert store.trades("000001.SZ") == []
+        assert len(store.trades(None, "600000.SH")) == 2
+        assert store.trades(None, "000001.SZ") == []
         # 持久化 + 重新加载
         store2 = DataStore(td)
-        assert len(store2.trades()) == 2
-        assert store2.trades()[0]["note"] == "首仓"
-        assert abs(store2.trades()[0]["price"] - 10.05) < 1e-9
+        assert len(store2.trades(None)) == 2
+        assert store2.trades(None)[0]["note"] == "首仓"
+        assert abs(store2.trades(None)[0]["price"] - 10.05) < 1e-9
         # 持仓汇总（latest_price=10.4）
-        pos = store2.positions()
+        pos = store2.positions(None)
         assert pos["600000.SH"]["held"] == 50
         assert abs(pos["600000.SH"]["avg_cost"] - 10.05) < 1e-9
         assert abs(pos["600000.SH"]["realized"] - (11.0 - 10.05) * 50) < 1e-6
         assert abs(pos["600000.SH"]["unrealized"] - (10.4 - 10.05) * 50) < 1e-6
         # 删除
-        ts, removed = store2.trade_remove("600000.SH", r1["id"])
+        ts, removed = store2.trade_remove(None, "600000.SH", r1["id"])
         assert removed and len(ts) == 1
-        assert DataStore(td).trades()[0]["side"] == "sell"
+        assert DataStore(td).trades(None)[0]["side"] == "sell"
         # 删除不存在的
-        ts, removed = store2.trade_remove("600000.SH", "no-such-id")
+        ts, removed = store2.trade_remove(None, "600000.SH", "no-such-id")
         assert not removed and len(ts) == 1
         # 其他股票的 id 不匹配
-        ts, removed = store2.trade_remove("000001.SZ", r2["id"])
+        ts, removed = store2.trade_remove(None, "000001.SZ", r2["id"])
         assert not removed and len(ts) == 1
 
 
 def t_store_update():
     with tempfile.TemporaryDirectory() as td:
         store = _make_store(Path(td))
-        ts, r1 = store.trade_add("600000.SH", "2026-10-20", "buy", 10.05, 100, "首仓")
+        ts, r1 = store.trade_add(None, "600000.SH", "2026-10-20", "buy", 10.05, 100, "首仓")
         # 部分字段更新（价格+备注）
-        ts, upd = store.trade_update("600000.SH", r1["id"], price=10.20, note="改价")
+        ts, upd = store.trade_update(None, "600000.SH", r1["id"], price=10.20, note="改价")
         assert upd["id"] == r1["id"] and upd["price"] == 10.20 and upd["note"] == "改价", upd
         assert upd["date"] == "2026-10-20" and upd["shares"] == 100, "未传字段不应变"
         # 更新日期/方向/股数
-        ts, upd = store.trade_update("600000.SH", r1["id"], date="2026-10-21", side="sell", shares=50)
+        ts, upd = store.trade_update(None, "600000.SH", r1["id"], date="2026-10-21", side="sell", shares=50)
         assert upd["date"] == "2026-10-21" and upd["side"] == "sell" and upd["shares"] == 50, upd
         # 清空备注
-        ts, upd = store.trade_update("600000.SH", r1["id"], note="")
+        ts, upd = store.trade_update(None, "600000.SH", r1["id"], note="")
         assert upd["note"] == "", upd
         # 排序随日期更新
-        assert store.trades()[0]["date"] == "2026-10-21"
+        assert store.trades(None)[0]["date"] == "2026-10-21"
         # 持久化
-        assert DataStore(td).trades()[0]["side"] == "sell"
+        assert DataStore(td).trades(None)[0]["side"] == "sell"
         # 校验：非法值拒绝且不落盘
-        before = store.trades()[0]
+        before = store.trades(None)[0]
         for kwargs in ({"price": -1}, {"shares": 10.5}, {"side": "hold"}, {"date": "2026-99-01"}):
             try:
-                store.trade_update("600000.SH", r1["id"], **kwargs)
+                store.trade_update(None, "600000.SH", r1["id"], **kwargs)
                 raise AssertionError(f"应当报错: {kwargs}")
             except ValueError:
                 pass
-        assert store.trades()[0] == before, "非法更新不应改动记录"
+        assert store.trades(None)[0] == before, "非法更新不应改动记录"
         # 不存在的 id
         try:
-            store.trade_update("600000.SH", "no-such-id", price=1)
+            store.trade_update(None, "600000.SH", "no-such-id", price=1)
             raise AssertionError("应当报错")
         except ValueError:
             pass
         # 其他股票的 id 不匹配
         try:
-            store.trade_update("000001.SZ", r1["id"], price=1)
+            store.trade_update(None, "000001.SZ", r1["id"], price=1)
             raise AssertionError("应当报错")
         except ValueError:
             pass
@@ -221,35 +221,35 @@ def t_store_fee():
     with tempfile.TemporaryDirectory() as td:
         store = _make_store(Path(td))
         # 不带 fee：记录无实际费用
-        ts, r1 = store.trade_add("600000.SH", "2026-10-20", "buy", 10.0, 100)
+        ts, r1 = store.trade_add(None, "600000.SH", "2026-10-20", "buy", 10.0, 100)
         assert "fee" not in r1 or r1.get("fee") is None, r1
         # 带 fee：持久化 + 回读
-        ts, r2 = store.trade_add("600000.SH", "2026-10-21", "sell", 11.0, 50, fee=6.3)
+        ts, r2 = store.trade_add(None, "600000.SH", "2026-10-21", "sell", 11.0, 50, fee=6.3)
         assert r2.get("fee") == 6.3, r2
-        back = DataStore(td).trades()
+        back = DataStore(td).trades(None)
         assert back[0].get("fee") is None and back[1].get("fee") == 6.3, back
         # 校验：负数 / 非数字拒绝
         for bad in (-1, "abc", float("inf")):
             try:
-                store.trade_add("600000.SH", "2026-10-22", "buy", 10.0, 10, fee=bad)
+                store.trade_add(None, "600000.SH", "2026-10-22", "buy", 10.0, 10, fee=bad)
                 raise AssertionError(f"应当报错: {bad}")
             except ValueError:
                 pass
         # update：设 / 清空 / 不动
-        ts, u = store.trade_update("600000.SH", r2["id"], fee=7.5)
+        ts, u = store.trade_update(None, "600000.SH", r2["id"], fee=7.5)
         assert u.get("fee") == 7.5, u
-        ts, u = store.trade_update("600000.SH", r2["id"], fee=None)
+        ts, u = store.trade_update(None, "600000.SH", r2["id"], fee=None)
         assert u.get("fee") is None, u
-        ts, u = store.trade_update("600000.SH", r2["id"], price=11.5)  # 未传 fee → 不动
+        ts, u = store.trade_update(None, "600000.SH", r2["id"], price=11.5)  # 未传 fee → 不动
         assert u.get("fee") is None and u["price"] == 11.5, u
-        ts, u = store.trade_update("600000.SH", r2["id"], fee=2.0)
+        ts, u = store.trade_update(None, "600000.SH", r2["id"], fee=2.0)
         assert u.get("fee") == 2.0, u
         try:
-            store.trade_update("600000.SH", r2["id"], fee=-5)
+            store.trade_update(None, "600000.SH", r2["id"], fee=-5)
             raise AssertionError("应当报错")
         except ValueError:
             pass
-        assert DataStore(td).trades()[1].get("fee") == 2.0
+        assert DataStore(td).trades(None)[1].get("fee") == 2.0
 
 
 def t_store_batch():
@@ -264,25 +264,25 @@ def t_store_batch():
             {"date": "2025-03-08", "side": "buy", "price": -1, "shares": 100},        # 价格错
             {"date": "2025-03-09", "side": "buy", "price": 10, "shares": 1.5},        # 股数错
         ]
-        ts, added, errors = store.trade_add_batch("600000.SH", items)
+        ts, added, errors = store.trade_add_batch(None, "600000.SH", items)
         assert len(added) == 2, added
         assert len(errors) == 4, errors
         assert [e["index"] for e in errors] == [2, 3, 4, 5], errors
         assert errors[1]["error"].startswith("side"), errors[1]
         # 持久化 + 排序
-        back = DataStore(td).trades()
+        back = DataStore(td).trades(None)
         assert len(back) == 2, back
         assert back[0]["date"] == "2025-03-05" and back[1]["date"] == "2025-03-06"
         assert back[1]["fee"] == 8.9 and back[1]["note"] == "止盈", back[1]
         # 空 / 非数组 / 超长
         for bad in ([], "x"):
             try:
-                store.trade_add_batch("600000.SH", bad)
+                store.trade_add_batch(None, "600000.SH", bad)
                 raise AssertionError(f"应当报错: {bad!r}")
             except ValueError:
                 pass
         try:
-            store.trade_add_batch("600000.SH", [{"date": "2025-03-01", "side": "buy", "price": 1, "shares": 1}] * 600)
+            store.trade_add_batch(None, "600000.SH", [{"date": "2025-03-01", "side": "buy", "price": 1, "shares": 1}] * 600)
             raise AssertionError("超 500 应当报错")
         except ValueError as e:
             assert "500" in str(e)
@@ -290,7 +290,7 @@ def t_store_batch():
         saved = ds._MAX_TRADES
         ds._MAX_TRADES = 2
         try:
-            ts, added2, errors2 = store.trade_add_batch(
+            ts, added2, errors2 = store.trade_add_batch(None, 
                 "600000.SH",
                 [{"date": f"2025-04-0{d}", "side": "buy", "price": 10, "shares": 100} for d in (1, 2, 3)],
             )

@@ -8,3 +8,6 @@ analyzer/output/
 .ipynb_checkpoints/
 .DS_Store
 watchlog/
+deploy.env
+.env
+.deploy/

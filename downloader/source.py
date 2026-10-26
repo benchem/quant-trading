@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import multiprocessing
+import os
 import threading
 import time
 
@@ -692,6 +693,11 @@ def _bs_patch_socket_connect() -> None:
         pass
 
 
+def _bs_pool_ping() -> int:
+    """预热探测：验证子进程能 import 本模块（spawn 需 cwd 在项目根）。"""
+    return os.getpid()
+
+
 def _bs_pool_get():
     """懒加载 spawn 进程池；失败置 _BS_POOL_DEAD 永久回退进程内。"""
     global _BS_POOL, _BS_POOL_DEAD
@@ -702,7 +708,7 @@ def _bs_pool_get():
 
         pool = ProcessPoolExecutor(
             max_workers=_BS_POOL_SIZE, mp_context=multiprocessing.get_context("spawn"))
-        pool.submit(int, 0).result(timeout=30)  # 预热首进程，失败视为不可用
+        pool.submit(_bs_pool_ping).result(timeout=30)  # 预热：验证子进程可导入本模块
         _BS_POOL = pool
         print(f"[source] baostock 兜底源已启用进程池 x{_BS_POOL_SIZE}"
               f"（独立连接 + {int(_BS_SOCKET_TIMEOUT)}s socket 超时）", flush=True)

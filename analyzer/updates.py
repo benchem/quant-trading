@@ -227,14 +227,21 @@ def write_eod_journals(store, day: str) -> dict:
             out["errors"].append(f"读取自选失败({u}): {e}")
             continue
         j = Journal(store.root, u)
+        # 当日去重（重跑防重复）：已写过快照事件的代码 / 已生成过复盘的代码
+        day_events = j.events(limit=500)
+        done_snap = {e.get("code") for e in day_events
+                     if e.get("day") == day and e.get("kind") == "system"}
+        done_reviews = {r.get("code") for r in j.reviews(limit=100)
+                        if r.get("day") == day}
         for code in codes:
             try:
-                prev, close, pct, _vol, _to = _kline_stats(code)
-                if close is not None:
-                    j.add_event(eod_snapshot_event(code, prev, close, pct,
-                                                   None, None))
-                    out["events"] += 1
-                if any(r.get("day") == day for r in j.reviews(code=code, limit=30)):
+                if code not in done_snap:
+                    prev, close, pct, _vol, _to = _kline_stats(code)
+                    if close is not None:
+                        j.add_event(eod_snapshot_event(code, prev, close, pct,
+                                                       None, None))
+                        out["events"] += 1
+                if code in done_reviews:
                     continue  # 当日已生成过复盘
                 review = journal_mod.build_daily_review(j, store, code, day)
                 if review is not None:
@@ -263,7 +270,8 @@ class EodUpdater:
 
     def __init__(self, store, notify, data_dir="data", trigger_hour=15, trigger_minute=30,
                  on_cache_invalidate=None, on_scan=None, runner=None,
-                 downloader_factory=None, syncer=None, check_interval: float = 20.0):
+                 downloader_factory=None, syncer=None, check_interval: float = 20.0,
+                 stall_timeout: float = 1200.0):
         self.store = store
         self.notify = notify
         self.data_dir = Path(data_dir)
@@ -274,6 +282,12 @@ class EodUpdater:
         self.runner = runner
         self.syncer = syncer
         self.check_interval = float(check_interval)
+        # 停滞看门狗：running 且心跳超过 stall_timeout 秒未推进 -> 判定挂死
+        # （2026-10-26 事故：baostock 裸 socket 无超时 + 全局锁，一条半开连接
+        #  让 EOD 无声停摆 1 小时）。默认 20 分钟 = 全市场最慢单股冷却余量。
+        self.stall_timeout = float(stall_timeout)
+        self._heartbeat = 0.0           # monotonic 时间戳，阶段推进/单股完成时打点
+        self._stall_reported = False    # 一次运行只告警+重启一次
         self._downloader_factory = downloader_factory
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -335,12 +349,48 @@ class EodUpdater:
                 if (now >= fire and self.last_run_day != fire.date().isoformat()
                         and not self._is_running()):
                     self.trigger(source="schedule")
+                self._watchdog()
                 # 触发时刻前的短暂睡眠（最多 check_interval，便于优雅退出）
                 delay = max(0.0, (fire - now).total_seconds())
                 self._stop.wait(min(delay, self.check_interval) if delay else self.check_interval)
             except Exception as e:  # noqa: BLE001 调度线程绝不因单次异常退出
                 time.sleep(self.check_interval)
                 self._error(f"调度循环异常: {e}")
+
+    # ------------------------------------------------------ 停滞看门狗
+
+    def _beat(self) -> None:
+        """心跳打点（阶段推进 / 单股完成）。"""
+        self._heartbeat = time.monotonic()
+
+    def _watchdog(self) -> None:
+        """检测 EOD 更新停滞：running 且心跳超时未推进 -> 告警 + 请求进程重启。
+
+        挂死通常发生在 C 扩展/裸 socket 的阻塞 read 上（GIL 不释放），
+        进程内无法自救；退出交给 systemd Restart=on-failure（10s 拉起）。
+        重启后 last_run_day 归零，调度器立即补跑当日，形成自愈闭环。
+        """
+        if not self._is_running() or self._stall_reported:
+            return
+        if self._heartbeat <= 0:
+            self._beat()
+            return
+        stalled = time.monotonic() - self._heartbeat
+        if stalled < self.stall_timeout:
+            return
+        self._stall_reported = True
+        stage = self.status.get("stage_label") or self.status.get("stage") or "?"
+        msg = (f"盘后更新停滞超过 {int(stalled // 60)} 分钟（阶段: {stage}），"
+               "疑似数据源挂死，服务将自动重启并补跑")
+        self._error(msg)
+        try:
+            self.notify.push(f"update:stall:{self.status.get('day') or ''}", msg,
+                             level="warn", desktop=True, source="system")
+        except Exception:  # noqa: BLE001
+            pass
+        import os
+
+        os._exit(1)  # 非零退出 -> systemd Restart=on-failure 10s 内拉起
 
     # ------------------------------------------------------ 触发入口
 
@@ -396,6 +446,8 @@ class EodUpdater:
                 "watchlist_n": len(codes), "source": source,
             })
         self.last_run_day = day
+        self._heartbeat = time.monotonic()
+        self._stall_reported = False
         self.notify.push(f"update:start:{day}",
                          f"盘后数据更新启动（{len(codes)} 只自选股优先刷新）",
                          level="info", desktop=False, source="system")
@@ -432,6 +484,7 @@ class EodUpdater:
             self.status["stage_label"] = STAGE_LABELS.get(key, key)
             self.status["stage_index"] = (_STAGE_ORDER.index(key) + 1
                                          if key in _STAGE_ORDER else 0)
+        self._beat()
 
     def _error(self, msg: str) -> None:
         with self._lock:
@@ -465,7 +518,7 @@ class EodUpdater:
         self._stage("watchlist_daily")
         if codes:
             try:
-                stats = dl.update_stocks(codes=",".join(codes))
+                stats = dl.update_stocks(codes=",".join(codes), on_progress=self._beat)
                 self._merge_stats({f"wl_{k}": v for k, v in (stats or {}).items()})
             except Exception as e:  # noqa: BLE001
                 self._error(f"自选股日线更新失败: {e}")
@@ -481,11 +534,12 @@ class EodUpdater:
                     fn(c)
                 except Exception:  # noqa: BLE001 资讯失败不影响主链路
                     pass
+                self._beat()  # 单股多源刷新可能很慢，逐项打点防看门狗误报
 
         # 4. 全市场日线（自选股刚更新过，增量判定为「已是最新」自动跳过，无需排除）
         self._stage("market_daily")
         try:
-            stats = dl.update_stocks()
+            stats = dl.update_stocks(on_progress=self._beat)
             self._merge_stats(stats)
         except Exception as e:  # noqa: BLE001
             self._error(f"全市场日线更新失败: {e}")

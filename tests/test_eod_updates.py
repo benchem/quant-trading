@@ -82,7 +82,7 @@ class FakeDownloader:
     def refresh_trade_calendar(self):
         return self._c("refresh_trade_calendar")
 
-    def update_stocks(self, codes=None):
+    def update_stocks(self, codes=None, on_progress=None):
         return self._c("update_stocks_watchlist" if codes else "update_stocks",
                        {"updated": 2, "uptodate": 1})
 
@@ -359,6 +359,149 @@ def t_datastore_reload_api():
     assert ctx._kline_cache == {}
 
 
+# ----------------------------------------------------------------- 看门狗
+
+
+def t_watchdog_stall_triggers_exit():
+    """running + 心跳超时 -> _error + 通知 + os._exit(1)。"""
+    import sys as _sys
+    import time as _t
+
+    with tempfile.TemporaryDirectory() as d:
+        up, _dl, nc, _ = _mk_updater(Path(d), ["600519.SH"])
+        up.run_now()  # 完整跑一轮（结束后 running=False）
+        # 伪造运行中 + 心跳过期
+        up.status["running"] = True
+        up.status["stage_label"] = "全市场日线"
+        up._heartbeat = _t.monotonic() - (up.stall_timeout + 60)
+        exit_codes = []
+        real_exit = _sys.modules["os"]._exit
+        _sys.modules["os"]._exit = exit_codes.append
+        try:
+            up._watchdog()
+        finally:
+            _sys.modules["os"]._exit = real_exit
+        assert exit_codes == [1], exit_codes
+        assert up._stall_reported is True
+        assert any("停滞" in e for e in up.status["errors"]), up.status["errors"]
+        assert any(m["key"].startswith("update:stall") for m in nc.list()["messages"])
+
+
+def t_watchdog_fresh_heartbeat_no_exit():
+    """心跳新鲜 / 未运行 -> 都不触发。"""
+    import time as _t
+
+    with tempfile.TemporaryDirectory() as d:
+        up, _dl, _nc, _ = _mk_updater(Path(d), ["600519.SH"])
+        up.run_now()
+        up.status["running"] = True
+        up._heartbeat = _t.monotonic()  # 刚打点
+        up._watchdog()
+        assert up._stall_reported is False
+        up.status["running"] = False
+        up._watchdog()
+        assert up._stall_reported is False
+
+
+def t_watchdog_progress_beat():
+    """on_progress 心跳透传到 update_stocks；完整链路推进会打点。"""
+
+    class BeatDl(FakeDownloader):
+        def update_stocks(self, codes=None, on_progress=None):
+            self.calls.append("update_stocks_watchlist" if codes else "update_stocks")
+            if on_progress is not None:
+                on_progress(1, 3)
+                on_progress(2, 3)
+            return {"updated": 2, "uptodate": 1}
+
+    with tempfile.TemporaryDirectory() as d:
+        store = FakeStore(["600519.SH"])
+        dl = BeatDl()
+        nc = NotificationCenter(Path(d) / "data")
+        up = EodUpdater(store, nc, data_dir=Path(d) / "data",
+                        on_scan=lambda cs: [], downloader_factory=lambda: dl)
+        for _name in ("_refresh_news", "_refresh_valuation", "_refresh_fundamental",
+                      "_refresh_flow", "_refresh_announce", "_refresh_sentiment"):
+            setattr(up, _name, lambda c: None)
+        import time as _t
+        before = up._heartbeat
+        _t.sleep(0.01)
+        up.run_now()
+        assert up._heartbeat > before  # 链路推进打过点
+        assert up.get_status()["running"] is False
+
+
+def t_bs_pool_routing_offline():
+    """_bs_query 路由：池死 -> 进程内；池返回数据 -> 直接用（离线 mock，不 spawn）。"""
+    from downloader import source as src
+
+    saved = (src._BS_POOL, src._BS_POOL_DEAD)
+    try:
+        # 1) 池标记死亡 -> 走 _bs_query_inproc
+        src._BS_POOL, src._BS_POOL_DEAD = None, True
+        called = {}
+
+        def fake_inproc(code, start, end, flag, _attempt=1):
+            called["inproc"] = (code, flag)
+            return [["2026-10-26", code, "1.0"]]
+
+        real_inproc = src._bs_query_inproc
+        src._bs_query_inproc = fake_inproc
+        try:
+            rows = src._bs_query("sz.000001", "20261026", "20261026", "1")
+        finally:
+            src._bs_query_inproc = real_inproc
+        assert rows == [["2026-10-26", "sz.000001", "1.0"]]
+        assert called["inproc"] == ("sz.000001", "1")
+
+        # 2) 池可用且返回数据 -> 不走进程内
+        class _Fut:
+            def result(self, timeout=None):
+                return [["2026-10-26", "sz.000001", "2.0"]]
+
+        class _Pool:
+            def submit(self, *a):
+                return _Fut()
+
+        src._BS_POOL_DEAD = False
+        src._BS_POOL = _Pool()
+        rows = src._bs_query("sz.000001", "20261026", "20261026", "1")
+        assert rows == [["2026-10-26", "sz.000001", "2.0"]]
+    finally:
+        src._BS_POOL, src._BS_POOL_DEAD = saved
+
+
+def t_update_stocks_on_progress():
+    """downloader.update_stocks 的 on_progress 每只回调（离线 mock fetch）。"""
+    import pandas as pd
+    from downloader.app import Downloader
+
+    with tempfile.TemporaryDirectory() as d:
+        dl = Downloader(data_dir=Path(d), adjust="hfq")
+        pd.DataFrame({"code": ["000001.SZ", "000002.SZ"], "name": ["平安", "万科"]}) \
+            .to_parquet(Path(d) / "stock_list.parquet")
+        import downloader.app as app_mod
+
+        def fake_fetch(wind_code, start, end, adjust):
+            return pd.DataFrame({
+                "date": pd.to_datetime(["2026-10-26"]),
+                "code": [wind_code], "open": [1.0], "high": [1.0], "low": [1.0],
+                "close": [1.0], "volume": [100], "amount": [100.0],
+                "amplitude": [0.0], "pct_chg": [0.0], "change": [0.0], "turnover": [0.0],
+            })
+
+        real_fetch = app_mod.source.fetch_daily
+        app_mod.source.fetch_daily = fake_fetch
+        beats = []
+        try:
+            stats = dl.update_stocks(codes="000001.SZ,000002.SZ",
+                                     on_progress=lambda done, total: beats.append((done, total)))
+        finally:
+            app_mod.source.fetch_daily = real_fetch
+        assert stats.get("new") == 2, stats
+        assert beats == [(1, 2), (2, 2)], beats
+
+
 def main() -> int:
     tests = [
         ("消息中心: 当日去重", t_notify_dedup),
@@ -373,6 +516,11 @@ def main() -> int:
         ("链路: 信号->消息提醒", t_signal_notify_integration),
         ("调度: 单例锁与同日重跑拒绝", t_trigger_singleton),
         ("接口: reload/清缓存存在", t_datastore_reload_api),
+        ("看门狗: 停滞触发告警+退出", t_watchdog_stall_triggers_exit),
+        ("看门狗: 心跳新鲜不误报", t_watchdog_fresh_heartbeat_no_exit),
+        ("看门狗: on_progress 心跳打点", t_watchdog_progress_beat),
+        ("baostock: 池路由/回退(离线)", t_bs_pool_routing_offline),
+        ("downloader: on_progress 透传", t_update_stocks_on_progress),
     ]
     for name, fn in tests:
         check(name, fn)

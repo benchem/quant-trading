@@ -21,6 +21,7 @@ HTTP 传输由 downloader.http.HttpClient 处理（自动适配 TLS 指纹过滤
 from __future__ import annotations
 
 import datetime as dt
+import multiprocessing
 import threading
 import time
 
@@ -624,11 +625,152 @@ def _tx_trade_dates() -> pd.Series:
 # 注意：baostock 后复权因子与腾讯 hfq 有 ~1% 差异（两家除权除息舍入口径不同），
 # 同一只股票跨供应商的 hfq 绝对价位不完全一致，收益率序列基本一致。
 # 仅支持沪深（北交所会报“股票代码未标识sh或sz”）。
-# 整个进程共享一条全局 TCP 连接 -> 所有调用必须持 _BS_LOCK 串行执行。
+#
+# baostock SDK 的硬伤（2026-10-26 事故复盘）：
+#   1) 全进程共享一条全局 TCP 连接（baostock.common.context.default_socket），
+#      且 SDK 自带全局锁语义 -> 全部调用必须持 _BS_LOCK 串行执行；
+#   2) SDK 的 socket 不设超时（socketutil.recv 死循环等数据），一条半开连接
+#      就会让持锁线程永久挂起 -> 4 个 worker 全部卡死、EOD 无声停摆 1 小时。
+# 因此这里用「spawn 子进程池」跑 baostock：每进程一条独立连接 + socket 超时 +
+# 父进程侧 result(timeout) 兜底，把「单点挂死」和「串行吞吐低」一起解决；
+# 池不可用（import 失败/创建失败）或查询超时/损坏时回退进程内老路径（CLI 单股查询仍可用）。
 _BS_ADJ = {"hfq": "1", "qfq": "2", "none": "3"}
 _BS_FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg"
 _BS_LOCK = threading.Lock()
 _BS_LOGGED_IN = False
+_BS_SOCKET_TIMEOUT = 60.0        # SDK socket 读超时（秒）
+_BS_POOL_QUERY_TIMEOUT = 90.0    # 单次查询父进程侧兜底超时（秒）；> socket 超时，
+                                 # 只有 worker 真僵死才触发，触发即击杀池
+_BS_POOL_SIZE = 4                # 子进程数（即并发连接数）
+_BS_POOL: object | None = None   # ProcessPoolExecutor（懒加载）
+_BS_POOL_DEAD = False            # 池创建失败/超时被击杀 -> 本进程内只走进程内路径
+_BS_PATCHED = False              # SocketUtil.connect 已打超时补丁
+
+try:  # py3.10: concurrent.futures.TimeoutError 不是内建 TimeoutError
+    from concurrent.futures import TimeoutError as _PoolTimeoutError
+except ImportError:  # pragma: no cover
+    _PoolTimeoutError = TimeoutError
+
+
+def _bs_apply_socket_timeout() -> None:
+    """给 baostock 全局 socket 设读超时（SDK 自身不设，recv 会永久阻塞）。
+
+    必须在 login() 之后调用：登录才会创建 context.default_socket。
+    子进程入口与进程内路径共用。
+    """
+    try:
+        import baostock.common.context as bs_ctx
+
+        sock = getattr(bs_ctx, "default_socket", None)
+        if sock is not None:
+            sock.settimeout(_BS_SOCKET_TIMEOUT)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _bs_patch_socket_connect() -> None:
+    """给 SocketUtil.connect 打补丁：连接一建立就设超时（幂等，进程内一次）。
+
+    覆盖 login 阶段以及仍走进程内的日历/行业查询——SDK 原版 connect 后
+    socket 无超时，半开连接会让 recv 永久阻塞并占死 _BS_LOCK。
+    """
+    global _BS_PATCHED
+    if _BS_PATCHED:
+        return
+    try:
+        import baostock.util.socketutil as bs_sock
+
+        _orig_connect = bs_sock.SocketUtil.connect
+
+        def _connect_with_timeout(self, api_key):
+            _orig_connect(self, api_key)
+            _bs_apply_socket_timeout()
+
+        bs_sock.SocketUtil.connect = _connect_with_timeout
+        _BS_PATCHED = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _bs_pool_get():
+    """懒加载 spawn 进程池；失败置 _BS_POOL_DEAD 永久回退进程内。"""
+    global _BS_POOL, _BS_POOL_DEAD
+    if _BS_POOL_DEAD or _BS_POOL is not None:
+        return _BS_POOL
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+
+        pool = ProcessPoolExecutor(
+            max_workers=_BS_POOL_SIZE, mp_context=multiprocessing.get_context("spawn"))
+        pool.submit(int, 0).result(timeout=30)  # 预热首进程，失败视为不可用
+        _BS_POOL = pool
+        print(f"[source] baostock 兜底源已启用进程池 x{_BS_POOL_SIZE}"
+              f"（独立连接 + {int(_BS_SOCKET_TIMEOUT)}s socket 超时）", flush=True)
+    except Exception as e:  # noqa: BLE001
+        _BS_POOL_DEAD = True
+        _BS_POOL = None
+        print(f"[source] baostock 进程池不可用（{str(e)[:60]}），回退进程内串行", flush=True)
+    return _BS_POOL
+
+
+def _bs_pool_kill(reason: str) -> None:
+    """击杀进程池：本进程后续全部走进程内路径（防泄漏槽位拖慢每只查询）。"""
+    global _BS_POOL, _BS_POOL_DEAD
+    if _BS_POOL_DEAD:
+        return
+    _BS_POOL_DEAD = True
+    pool, _BS_POOL = _BS_POOL, None
+    print(f"[source] baostock 进程池异常（{reason}），本轮剩余查询回退进程内串行", flush=True)
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _bs_pool_worker(code: str, start: str, end: str, flag: str) -> list[list]:
+    """子进程入口：打补丁 -> 登录 -> 查询 -> 返回原始行。
+
+    每个子进程一条独立 TCP 连接，互不共享，无需加锁。
+    数据级错误（登录失败/查询失败）以异常上抛，由父进程按老语义处理。
+    """
+    import baostock as bs
+
+    _bs_patch_socket_connect()
+    lg = bs.login()
+    if lg.error_code != "0":
+        raise RuntimeError(f"baostock 登录失败: {lg.error_msg}")
+    rs = bs.query_history_k_data_plus(
+        code, _BS_FIELDS,
+        start_date=_bs_iso(start), end_date=_bs_iso(end),
+        frequency="d", adjustflag=flag,
+    )
+    if rs.error_code != "0":
+        raise RuntimeError(f"baostock 查询失败 ({code}): {rs.error_msg}")
+    rows: list[list] = []
+    while rs.error_code == "0" and rs.next():
+        rows.append(rs.get_row_data())
+    return rows
+
+
+def _bs_query_via_pool(code: str, start: str, end: str, flag: str):
+    """经进程池查询。
+
+    返回 None 表示池基础设施不可用（懒加载失败/超时被击杀），调用方回退进程内；
+    worker 的数据级异常正常上抛（与进程内路径同语义）。
+    """
+    pool = _bs_pool_get()
+    if pool is None:
+        return None
+    try:
+        fut = pool.submit(_bs_pool_worker, code, start, end, flag)
+        return fut.result(timeout=_BS_POOL_QUERY_TIMEOUT)
+    except _PoolTimeoutError:
+        _bs_pool_kill(f"查询超时 >{int(_BS_POOL_QUERY_TIMEOUT)}s")
+        return None
+    except BrokenProcessPool:
+        _bs_pool_kill("子进程池损坏")
+        return None
 
 
 def _bs_iso(yyyymmdd: str) -> str:
@@ -649,6 +791,7 @@ def _bs_ensure_login(relogin: bool = False) -> None:
 
     if _BS_LOGGED_IN and not relogin:
         return
+    _bs_patch_socket_connect()
     try:
         bs.logout()
     except Exception:  # noqa: BLE001
@@ -656,10 +799,20 @@ def _bs_ensure_login(relogin: bool = False) -> None:
     lg = bs.login()
     if lg.error_code != "0":
         raise FetchError(f"baostock 登录失败: {lg.error_msg}")
+    _bs_apply_socket_timeout()  # login 创建 socket 后立即设超时，防 recv 永久阻塞
     _BS_LOGGED_IN = True
 
 
-def _bs_query(code: str, start: str, end: str, flag: str, _attempt: int = 1) -> list[list]:
+def _bs_query(code: str, start: str, end: str, flag: str) -> list[list]:
+    """baostock 查询入口：优先 spawn 子进程池（并发+隔离挂死），回退进程内串行。"""
+    rows = _bs_query_via_pool(code, start, end, flag)
+    if rows is not None:
+        return rows
+    return _bs_query_inproc(code, start, end, flag)
+
+
+def _bs_query_inproc(code: str, start: str, end: str, flag: str, _attempt: int = 1) -> list[list]:
+    """进程内串行查询（持 _BS_LOCK，一次断线重登录重试）。"""
     global _BS_LOGGED_IN
     import baostock as bs
 
@@ -673,7 +826,7 @@ def _bs_query(code: str, start: str, end: str, flag: str, _attempt: int = 1) -> 
         if rs.error_code != "0":
             if _attempt == 1:
                 _BS_LOGGED_IN = False  # 连接可能已断，重新登录后重试一次
-                return _bs_query(code, start, end, flag, _attempt + 1)
+                return _bs_query_inproc(code, start, end, flag, _attempt + 1)
             raise FetchError(f"baostock 查询失败 ({code}): {rs.error_msg}")
         rows: list[list] = []
         while rs.error_code == "0" and rs.next():

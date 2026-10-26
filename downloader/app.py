@@ -265,7 +265,9 @@ class Downloader:
         full: bool = False,
         market: str = "all",
         limit: Optional[int] = None,
+        on_progress=None,
     ) -> dict:
+        """on_progress(done, total): 每完成一只回调一次（供 EOD 看门狗采集心跳）。"""
         end = _norm_end(end)
         stock_list = self._stock_list()
         if codes:
@@ -292,6 +294,7 @@ class Downloader:
         stats = {"new": 0, "updated": 0, "uptodate": 0, "nodata": 0, "failed": 0, "skipped": 0}
         failures: list[tuple[str, str]] = []
         t0 = time.time()
+        total = len(targets)
         pool = ThreadPoolExecutor(max_workers=self.workers)
         try:
             futs = {
@@ -301,11 +304,18 @@ class Downloader:
             prog = as_completed(futs)
             if tqdm is not None:
                 prog = tqdm(prog, total=len(futs), desc="A股日线", unit="只")
+            done = 0
             for fut in prog:
                 code, status, msg = fut.result()
                 stats[status] = stats.get(status, 0) + 1
                 if status == "failed":
                     failures.append((code, msg))
+                done += 1
+                if on_progress is not None:
+                    try:
+                        on_progress(done, total)
+                    except Exception:  # noqa: BLE001 心跳回调绝不影响主链路
+                        pass
         except KeyboardInterrupt:
             _log("用户中断，取消剩余任务……")
             for f in futs:

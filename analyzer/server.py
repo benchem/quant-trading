@@ -117,6 +117,15 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
         否则所有业务 API 需登录（自选/交易/站内信按用户隔离）。"""
     hub = isinstance(notifier, NotificationHub)
 
+    def _journal_trade_event(user: str | None, rec: dict) -> None:
+        """交易登记成功后写一条 journal 事件（失败静默——不影响交易主链路）。"""
+        try:
+            from .journal import Journal, event_from_trade
+
+            Journal(store.root, user).add_event(event_from_trade(rec))
+        except Exception:  # noqa: BLE001 日记是旁路，绝不阻塞交易记录
+            pass
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "ashare-analyzer/1.0"
 
@@ -364,6 +373,51 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                     except Exception as e:  # NewsError 及其他
                         return self._json({"error": f"新闻数据不可用: {str(e)[:120]}"}, 502)
                     self._json(data)
+                elif path == "/api/flow":
+                    code = (params.get("code") or "").upper()
+                    if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
+                        return self._json({"error": "code 格式应为 600519.SH"}, 400)
+                    try:
+                        from . import flow as flow_mod
+
+                        self._json(flow_mod.fetch(code, store.root,
+                                                  refresh=params.get("refresh") == "1"))
+                    except Exception as e:  # noqa: BLE001 数据源故障降级为 502
+                        return self._json({"error": f"资金流数据不可用: {str(e)[:120]}"}, 502)
+                elif path == "/api/announce":
+                    code = (params.get("code") or "").upper()
+                    if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
+                        return self._json({"error": "code 格式应为 600519.SH"}, 400)
+                    try:
+                        from . import announce as announce_mod
+
+                        self._json(announce_mod.fetch(code, store.root,
+                                                       refresh=params.get("refresh") == "1"))
+                    except Exception as e:  # noqa: BLE001
+                        return self._json({"error": f"公告数据不可用: {str(e)[:120]}"}, 502)
+                elif path == "/api/sentiment":
+                    code = (params.get("code") or "").upper()
+                    if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
+                        return self._json({"error": "code 格式应为 600519.SH"}, 400)
+                    try:
+                        from . import sentiment as sentiment_mod
+
+                        self._json(sentiment_mod.fetch(code, store.root,
+                                                        refresh=params.get("refresh") == "1"))
+                    except Exception as e:  # noqa: BLE001
+                        return self._json({"error": f"情绪数据不可用: {str(e)[:120]}"}, 502)
+                elif path == "/api/journal":
+                    # 交易日记（按用户隔离）：事件 + 笔记 + 复盘一次取回
+                    from .journal import Journal
+
+                    j = Journal(store.root, user)
+                    code = (params.get("code") or "").upper() or None
+                    self._json({
+                        "code": code,
+                        "events": j.events(code=code, limit=int(params.get("limit", 100))),
+                        "notes": j.notes(code=code, limit=int(params.get("notes_limit", 50))),
+                        "reviews": j.reviews(code=code, limit=int(params.get("reviews_limit", 20))),
+                    })
                 elif path == "/api/valuation":
                     code = (params.get("code") or "").upper()
                     if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
@@ -632,6 +686,7 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                         req.get("note", ""),
                         fee=req.get("fee"),
                     )
+                    _journal_trade_event(user, rec)
                     self._json({"code": rec["code"], "trades": trades, "added": rec})
                 elif action == "remove":
                     code = (req.get("code") or "").upper()
@@ -656,12 +711,81 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                 elif action == "add_batch":
                     code = (req.get("code") or "").upper()
                     trades, added, errors = store.trade_add_batch(user, code, req.get("trades"))
+                    for rec in added:
+                        _journal_trade_event(user, rec)
                     self._json({"code": code, "trades": trades, "added": added,
                                 "errors": errors, "n_added": len(added)})
                 else:
                     return self._json({"error": "action 应为 add/remove/update/add_batch"}, 400)
             except ValueError as e:
                 self._json({"error": str(e)}, 400)
+
+        def _post_journal(self, user: str | None):
+            """交易日记（按用户隔离）：笔记 CRUD + 复盘生成（规则版/LLM 版）。"""
+            from . import journal as journal_mod
+            from .journal import Journal
+
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b"{}"
+                req = json.loads(body.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                return self._json({"error": "请求体应为 JSON"}, 400)
+            action = req.get("action")
+            code = (req.get("code") or "").upper() or None
+            if code and not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
+                return self._json({"error": "code 格式应为 600519.SH"}, 400)
+            j = Journal(store.root, user)
+            try:
+                if action == "note_add":
+                    rec = j.add_note(code, req.get("text") or "",
+                                     day=req.get("day") or None,
+                                     tags=req.get("tags"))
+                    self._json({"ok": True, "note": rec})
+                elif action == "note_update":
+                    rec = j.update_note(str(req.get("id") or ""),
+                                        text=req.get("text"),
+                                        tags=req.get("tags"))
+                    if rec is None:
+                        return self._json({"error": "笔记不存在"}, 404)
+                    self._json({"ok": True, "note": rec})
+                elif action == "note_delete":
+                    ok = j.delete_note(str(req.get("id") or ""))
+                    self._json({"ok": ok, "deleted": ok})
+                elif action == "review_generate":
+                    # 规则版复盘（本地统计，不调 LLM，随时可用）
+                    if not code:
+                        return self._json({"error": "需要 code 参数"}, 400)
+                    day = req.get("day") or time.strftime("%Y-%m-%d")
+                    review = journal_mod.build_daily_review(j, store, code, day)
+                    if review is None:
+                        return self._json({"error": "当日无事件且无行情，无可复盘内容"}, 400)
+                    rec = j.add_review(day, code, review["summary"],
+                                       lines=review["lines"], version="rule")
+                    self._json({"ok": True, "review": rec})
+                elif action == "review_llm":
+                    # LLM 版复盘：基于当日规则版复盘（无则先生成）+ 笔记 + 信号事件
+                    if not code:
+                        return self._json({"error": "需要 code 参数"}, 400)
+                    day = req.get("day") or time.strftime("%Y-%m-%d")
+                    review = journal_mod.build_daily_review(j, store, code, day)
+                    if review is None:
+                        return self._json({"error": "当日无事件且无行情，无可复盘内容"}, 400)
+                    try:
+                        out = journal_mod.build_llm_review(j, code, day, review)
+                    except journal_mod.__dict__.get("AIError", RuntimeError) as e:  # noqa: BLE001
+                        # AIError 从 analyzer.ai 延迟导入，此处统一兜住
+                        return self._json({"error": str(e)}, getattr(e, "status", 502))
+                    rec = j.add_review(day, code, out["report"], version="llm")
+                    self._json({"ok": True, "review": rec, "usage": out.get("usage")})
+                else:
+                    return self._json({"error": "action 应为 note_add/note_update/"
+                                                "note_delete/review_generate/review_llm"}, 400)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                return self._json({"error": f"日记操作失败: {str(e)[:120]}"}, 500)
 
         def _post_update(self):
             """手动触发一轮盘后更新链路（异步；进度经 /api/update/status 查询）。"""
@@ -749,6 +873,8 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                 return self._post_us_brief_push()
             if path == "/api/notifications":
                 return self._post_notifications(user)
+            if path == "/api/journal":
+                return self._post_journal(user)
             self._json({"error": "unknown api"}, 404)
 
         def do_GET(self):  # noqa: N802

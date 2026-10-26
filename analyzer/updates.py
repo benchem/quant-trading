@@ -4,13 +4,14 @@
 
     1. 基础信息   股票列表 + 交易日历
     2. 自选日线   自选股后复权日线优先增量更新（数据最快可用）
-    3. 自选资讯   自选股新闻 / 估值 / 财报强制刷新（refresh 绕过本地缓存 TTL）
+    3. 自选资讯   自选股新闻 / 估值 / 财报 / 资金流 / 公告 / 情绪 强制刷新
     4. 全市场日线 剩余股票增量更新
     5. 指数日线   主要指数
     6. 板块成分   行业板块（含概念板块）
     7. 数据集合并 build_dataset（供 DataStore 市场聚合 / 排行使用）
     8. 缓存失效   DataStore.reload + 插件 Runner/Context 缓存清空
     9. 信号扫描   逐只自选股跑模型插件，alert 级信号 -> 消息中心 + macOS 通知
+   10. 交易日记   信号/盘后快照写入对应用户 journal + 自动生成规则版复盘
 
 设计要点：
 - 单例锁：同一进程内同一时刻只允许一个更新任务（手动触发同理）；
@@ -48,6 +49,7 @@ STAGES = (
     ("dataset", "数据集合并"),
     ("reload", "缓存刷新"),
     ("scan", "信号扫描"),
+    ("journal", "交易日记"),
 )
 STAGE_LABELS = dict(STAGES)
 _STAGE_ORDER = [k for k, _ in STAGES]
@@ -76,12 +78,18 @@ def _is_trading_day(data_dir, d: dt.date) -> bool:
 
 def next_fire(now: dt.datetime, data_dir, trigger_hour: int = 15,
               trigger_minute: int = 30) -> tuple[dt.datetime, bool]:
-    """下一个触发时刻（CST）；now 早于今日触发时间且为交易日 -> (今日, False)，
-    否则找次日之后的第一个交易日 -> (次日后, True 表示需后台等待)。"""
+    """下一个触发时刻（CST）；today 为交易日时恒返回 (今日 trigger 时刻, False)，
+    否则找次日之后的第一个交易日 -> (次日后, True 表示需后台等待)。
+
+    注意：now 已过今日触发时刻时仍返回「今日」——2026-10-26 事故中旧逻辑
+    直接跳到次日，导致 _loop 里 `now >= fire` 永不成立、schedule 触发与
+    「补跑」双双失效（服务在跑但一天也没拉过数据）。今日已跑的判定由
+    EodUpdater.last_run_day 负责，不在这里做。
+    """
     today = now.date()
     fire = now.replace(hour=trigger_hour, minute=trigger_minute,
                        second=0, microsecond=0)
-    if now < fire and _is_trading_day(data_dir, today):
+    if _is_trading_day(data_dir, today):
         return fire, False
     d = today + dt.timedelta(days=1)
     for _ in range(90):  # 硬上限：日历完全不可用时避免无限寻日
@@ -131,6 +139,110 @@ def scan_watchlist_signals(store, runner, codes, plugins=SCAN_PLUGINS,
                 out.append({"code": code, "name": name, "plugin": plugin,
                             "level": "warn",
                             "text": f"{label} 当日触发信号" + (f"：{summary}" if summary else "")})
+    return out
+
+
+# ------------------------------------------------------------------ 交易日记
+
+
+def _journal_users(store) -> list[str | None]:
+    """需要写 journal 的用户集合：共享模式 [None]；多用户模式为全部用户。"""
+    try:
+        users = store.known_users()
+    except Exception:  # noqa: BLE001
+        users = []
+    return list(users) if users else [None]
+
+
+def _journal_targets(store, users, code: str) -> list[str | None]:
+    """某只股票的 journal 归属用户：自选含该股的用户。
+
+    共享模式（users=[None]）恒返回 [None]（单一共享桶）。
+    """
+    out: list[str | None] = []
+    for u in users:
+        try:
+            wl = store.watchlist_codes(u) or []
+        except Exception:  # noqa: BLE001
+            wl = []
+        if code in wl:
+            out.append(u)
+    return out
+
+
+def write_signal_events(store, hits: list[dict]) -> int:
+    """信号扫描命中写入对应用户的 journal 事件流；返回写入条数。
+
+    归属规则与 NotificationHub 一致：自选股包含该股的用户；多用户模式下
+    无人自选则广播给全部用户（与站内信「不丢消息」语义对齐）。
+    """
+    from .journal import Journal, event_from_signal
+
+    users = _journal_users(store)
+    n = 0
+    for h in hits:
+        code = str(h.get("code", "")).upper()
+        targets = _journal_targets(store, users, code)
+        if not targets:
+            targets = list(users)  # 无人自选 -> 广播
+        for u in targets:
+            try:
+                Journal(store.root, u).add_event(event_from_signal(h))
+                n += 1
+            except Exception:  # noqa: BLE001 单用户失败不影响其余
+                continue
+    return n
+
+
+def write_eod_journals(store, day: str) -> dict:
+    """journal 收尾：盘后快照事件 + 当日规则版复盘，逐用户逐自选股生成。
+
+    返回 {"events": 写入事件数, "reviews": 生成复盘数, "errors": [...]}。
+    每用户的每只自选股：1 条盘后快照事件 + 1 份规则版复盘（当日已有该股
+    复盘则跳过——手动触发过就不重复生成）。
+    """
+    from . import journal as journal_mod
+    from .journal import Journal, eod_snapshot_event
+
+    out = {"events": 0, "reviews": 0, "errors": []}
+
+    def _kline_stats(code: str):
+        try:
+            k = store.kline(code)
+        except Exception:  # noqa: BLE001
+            return (None, None, None, None, None)
+        if not k:
+            return (None, None, None, None, None)
+        closes = [c for c in (k.get("close") or []) if c is not None]
+        if not closes:
+            return (None, None, None, None, None)
+        prev = closes[-2] if len(closes) >= 2 else None
+        pct = (closes[-1] / prev - 1.0) * 100 if prev else None
+        return (prev, closes[-1], pct, None, None)
+
+    for u in _journal_users(store):
+        try:
+            codes = store.watchlist_codes(u) or []
+        except Exception as e:  # noqa: BLE001
+            out["errors"].append(f"读取自选失败({u}): {e}")
+            continue
+        j = Journal(store.root, u)
+        for code in codes:
+            try:
+                prev, close, pct, _vol, _to = _kline_stats(code)
+                if close is not None:
+                    j.add_event(eod_snapshot_event(code, prev, close, pct,
+                                                   None, None))
+                    out["events"] += 1
+                if any(r.get("day") == day for r in j.reviews(code=code, limit=30)):
+                    continue  # 当日已生成过复盘
+                review = journal_mod.build_daily_review(j, store, code, day)
+                if review is not None:
+                    j.add_review(day, code, review["summary"],
+                                 lines=review["lines"], version="rule")
+                    out["reviews"] += 1
+            except Exception as e:  # noqa: BLE001 单股失败不影响其余
+                out["errors"].append(f"{code}: {e}")
     return out
 
 
@@ -358,10 +470,13 @@ class EodUpdater:
             except Exception as e:  # noqa: BLE001
                 self._error(f"自选股日线更新失败: {e}")
 
-        # 3. 自选股资讯刷新（新闻/估值/财报，强制绕过缓存 TTL；失败静默降级）
+        # 3. 自选股资讯刷新（新闻/估值/财报/资金流/公告/情绪，强制绕过缓存
+        #    TTL；失败静默降级——资讯类失败不影响主链路）
         self._stage("watchlist_info")
         for c in codes:
-            for fn in (self._refresh_news, self._refresh_valuation, self._refresh_fundamental):
+            for fn in (self._refresh_news, self._refresh_valuation,
+                       self._refresh_fundamental, self._refresh_flow,
+                       self._refresh_announce, self._refresh_sentiment):
                 try:
                     fn(c)
                 except Exception:  # noqa: BLE001 资讯失败不影响主链路
@@ -408,7 +523,7 @@ class EodUpdater:
             except Exception as e:  # noqa: BLE001
                 self._error(f"分析缓存清理失败: {e}")
 
-        # 9. 自选股信号扫描 -> 消息提醒
+        # 9. 自选股信号扫描 -> 消息提醒 + journal 事件
         self._stage("scan")
         n_sig = 0
         if codes:
@@ -428,8 +543,24 @@ class EodUpdater:
                     text=f"⚡ {h['name']}({h['code']}) {h['text']}",
                     level=h.get("level", "alert"), code=h["code"], desktop=True,
                     source="model", extra={"plugin": h["plugin"]})
+            try:
+                write_signal_events(self.store, hits)
+            except Exception as e:  # noqa: BLE001 journal 旁路失败不阻塞
+                self._error(f"信号事件写入日记失败: {e}")
         with self._lock:
             self.status["signals"] = n_sig
+
+        # 10. 交易日记收尾：盘后快照事件 + 规则版复盘（按用户隔离）
+        self._stage("journal")
+        try:
+            jr = write_eod_journals(self.store, day)
+            if jr.get("errors"):
+                self._error(f"交易日记部分失败: {jr['errors'][0]}"
+                            + (f" 等{len(jr['errors'])}项" if len(jr["errors"]) > 1 else ""))
+            self._merge_stats({"journal_events": jr.get("events", 0),
+                               "journal_reviews": jr.get("reviews", 0)})
+        except Exception as e:  # noqa: BLE001
+            self._error(f"交易日记写入失败: {e}")
         self._end()
 
     def _name_of(self, code: str) -> str:
@@ -454,3 +585,18 @@ class EodUpdater:
         from .fundamental import fetch
 
         fetch(code, self.store.root, force=True)
+
+    def _refresh_flow(self, code: str) -> None:
+        from .flow import fetch
+
+        fetch(code, self.store.root, refresh=True)
+
+    def _refresh_announce(self, code: str) -> None:
+        from .announce import fetch
+
+        fetch(code, self.store.root, refresh=True)
+
+    def _refresh_sentiment(self, code: str) -> None:
+        from .sentiment import fetch
+
+        fetch(code, self.store.root, refresh=True)

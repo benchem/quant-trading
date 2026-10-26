@@ -44,10 +44,19 @@ def check(name: str, fn) -> bool:
 class FakeStore:
     def __init__(self, codes):
         self._wl_codes = list(codes)
-        self.root = Path("data")
+        self.root = Path(tempfile.mkdtemp(prefix="fake-store-"))  # 离线: 隔离 root
         self.basic = pd.DataFrame({"name": ["茅台", "宁德"][: len(codes)]},
                                   index=self._wl_codes)
         self.reload_calls = 0
+
+    def known_users(self):
+        return []
+
+    def watchlist_codes(self, user=None):
+        return list(self._wl_codes)
+
+    def kline(self, code, **kw):
+        return None
 
     def reload(self):
         self.reload_calls += 1
@@ -117,6 +126,10 @@ def _mk_updater(tmp, codes, dl_kwargs=None, results=None):
                     on_scan=lambda cs: scan_watchlist_signals(store, runner, cs),
                     runner=runner,
                     downloader_factory=lambda: dl)
+    # 离线约定: 资讯刷新（阶段3）全部 no-op，不打真实数据源
+    for _name in ("_refresh_news", "_refresh_valuation", "_refresh_fundamental",
+                  "_refresh_flow", "_refresh_announce", "_refresh_sentiment"):
+        setattr(up, _name, lambda c: None)
     return up, dl, nc, store
 
 
@@ -178,10 +191,27 @@ def t_next_fire_calendar():
         fire, wait = next_fire(dt.datetime(2026, 10, 23, 14, 0, tzinfo=CST), p)
         assert (fire.date(), fire.time()) == (dt.date(2026, 10, 23), dt.time(15, 30))
         assert wait is False
-        # 已过触发点 -> 下一交易日（周末按日历跳过）
-        fire2, _ = next_fire(dt.datetime(2026, 10, 23, 15, 31, tzinfo=CST), p)
-        assert fire2.date() == dt.date(2026, 10, 26)
-        assert fire2.time() == dt.time(15, 30)
+        # 已过触发点(15:31) -> 仍返回今日 15:30（由 last_run_day 防同日重跑；
+        # 旧语义「跳下一交易日」会让 _loop 的 now>=fire 永不成立，调度成死代码）
+        fire2, wait2 = next_fire(dt.datetime(2026, 10, 23, 15, 31, tzinfo=CST), p)
+        assert (fire2.date(), fire2.time()) == (dt.date(2026, 10, 23), dt.time(15, 30))
+        assert wait2 is False
+
+
+def t_next_fire_catchup_regression():
+    """2026-10-26 事故回归：交易日已过 15:30 必须仍指向今日，否则永远不触发。"""
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d)
+        # 复刻服务器日历: 只覆盖到 2026-10-23（未来日期退化为工作日判断）
+        pd.DataFrame({"trade_date": pd.date_range("2020-01-01", "2026-10-23", freq="B")}) \
+            .to_parquet(p / "trade_calendar.parquet")
+        # 事故现场: 周一 15:48，当日更新未跑
+        fire, wait = next_fire(dt.datetime(2026, 10, 26, 15, 48, tzinfo=CST), p)
+        assert (fire.date(), fire.time()) == (dt.date(2026, 10, 26), dt.time(15, 30)), fire
+        assert wait is False
+        # 周六 -> 下一个交易日周一（非交易日不回归当日）
+        fire2, wait2 = next_fire(dt.datetime(2026, 10, 24, 10, 0, tzinfo=CST), p)
+        assert fire2.date() == dt.date(2026, 10, 26) and wait2 is True
 
 
 def t_next_fire_fallback():
@@ -291,6 +321,9 @@ def t_trigger_singleton():
         up = EodUpdater(FakeStore(["600519.SH"]), NotificationCenter(Path(d) / "data"),
                         data_dir=Path(d), on_scan=lambda cs: [],
                         downloader_factory=lambda: dl)
+        for _name in ("_refresh_news", "_refresh_valuation", "_refresh_fundamental",
+                      "_refresh_flow", "_refresh_announce", "_refresh_sentiment"):
+            setattr(up, _name, lambda c: None)  # 离线: 资讯刷新 no-op
         assert up.trigger(source="manual")["ok"] is True
         assert started.wait(5)
         assert up.get_status()["running"] is True
@@ -331,6 +364,7 @@ def main() -> int:
         ("消息中心: 当日去重", t_notify_dedup),
         ("消息中心: 持久化/游标/已读", t_notify_persist_cursor),
         ("调度: 交易日历 next_fire", t_next_fire_calendar),
+        ("调度: 事故回归 过点仍指今日(补跑)", t_next_fire_catchup_regression),
         ("调度: 无日历退化工作日", t_next_fire_fallback),
         ("扫描: alert/warn 信号提取", t_scan_signals),
         ("扫描: 插件异常隔离", t_scan_crash_isolation),

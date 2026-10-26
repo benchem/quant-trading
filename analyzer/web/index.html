@@ -27,6 +27,7 @@
   <button class="tab active" data-tab="market">市场</button>
   <button class="tab" data-tab="stock">个股分析</button>
   <button class="tab" data-tab="trades">交易记录</button>
+  <button class="tab" data-tab="journal">交易日记</button>
   <button class="tab" data-tab="inbox">站内信<span class="tab-badge" id="inbox-tab-badge" style="display:none">0</span></button>
 </nav>
 
@@ -253,6 +254,7 @@
       <button class="subtab" data-sub="cd">筹码分布</button>
       <button class="subtab" data-sub="bb">布林通道</button>
       <button class="subtab" data-sub="fund">财报</button>
+      <button class="subtab" data-sub="flow">资金/公告</button>
       <button class="subtab" data-sub="ai">AI 分析</button>
     </div>
 
@@ -438,6 +440,32 @@
       </div>
     </div>
 
+    <div class="subpanel" data-subpanel="flow">
+      <div class="chart-box">
+        <div class="chart-title">
+          资金流向（东方财富：主力/超大单/大单/中单/小单 净流入，近 120 日）
+          <span id="flow-status" class="hint"></span>
+        </div>
+        <div class="chart" id="chart-flow"><div class="loading">加载中…</div></div>
+        <div class="hint" id="flow-hint">主力净流入为已发生的资金行为统计，不构成趋势保证</div>
+      </div>
+      <div class="chart-box">
+        <div class="chart-title">
+          公司公告（巨潮资讯，近 180 日）
+          <span id="ann-status" class="hint"></span>
+        </div>
+        <div class="table-wrap" style="max-height:320px">
+          <table class="rank-table" id="ann-table">
+            <thead>
+              <tr><th>日期</th><th>公告标题</th><th>链接</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="hint">公告为法定披露文件，此处仅展示标题；情绪/千股千评数据噪声大，仅作参考（已并入 AI 分析上下文）</div>
+      </div>
+    </div>
+
     <div class="subpanel" data-subpanel="ai">
       <div class="chart-box">
         <div class="chart-title">
@@ -598,6 +626,55 @@
   </section>
 
   <!-- ===================== 站内信（统一收件箱） ===================== -->
+  <!-- ===================== 交易日记（记忆与复盘，按用户隔离） ===================== -->
+  <section id="tab-journal" class="panel">
+    <div class="toolbar">
+      <span class="toolbar-label">股票</span>
+      <div class="search-box">
+        <input id="journal-search" type="text" placeholder="按代码筛选事件/笔记/复盘，如 300687" autocomplete="off">
+      </div>
+      <span class="hint" id="journal-count" style="margin:0"></span>
+      <button id="journal-refresh" class="mini-btn">刷新</button>
+    </div>
+    <div class="chart-box">
+      <div class="chart-title">
+        事件流（交易 / 模型信号 / 盘后快照，自动记录）
+        <span class="hint">事件由系统自动写入：登记交易、盘后信号扫描、每日收盘快照</span>
+      </div>
+      <div class="table-wrap" style="max-height:300px">
+        <table class="rank-table" id="journal-events-table">
+          <thead><tr><th>日期</th><th>时间</th><th>类型</th><th>代码</th><th>内容</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="chart-box">
+      <div class="chart-title">我的笔记（观察 / 计划 / 复盘感想）</div>
+      <div class="ai-actions">
+        <input id="journal-note-code" type="text" placeholder="代码（可空，如 300687.SZ）" style="width:130px">
+        <input id="journal-note-text" type="text" placeholder="记一笔：观察、计划、教训…" style="flex:1">
+        <button id="journal-note-add" class="mini-btn">添加笔记</button>
+      </div>
+      <div class="table-wrap" style="max-height:260px">
+        <table class="rank-table" id="journal-notes-table">
+          <thead><tr><th>日期</th><th>代码</th><th>笔记</th><th>操作</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="chart-box">
+      <div class="chart-title">
+        每日复盘（盘后自动生成规则版；可生成 LLM 版）
+        <div class="ai-actions" style="margin-left:auto">
+          <input id="journal-review-code" type="text" placeholder="代码，如 300687.SZ" style="width:130px">
+          <button id="journal-review-gen" class="mini-btn">生成复盘（规则版）</button>
+          <button id="journal-review-llm" class="mini-btn" title="调用云端大模型，需 AI_API_KEY">生成 LLM 复盘</button>
+        </div>
+      </div>
+      <div id="journal-reviews"></div>
+    </div>
+  </section>
+
   <section id="tab-inbox" class="panel">
     <div class="inbox-wrap">
       <aside class="inbox-rail" id="inbox-rail"></aside>

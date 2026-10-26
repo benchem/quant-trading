@@ -913,6 +913,8 @@ async function pickStock(code, opts = {}) {
     loadBB();
     loadChips();
     loadFund();
+    loadFlow();          // 资金流子标签（内含公告表加载）
+    loadAnnounce();
     resetAIPanel();      // AI 报告不自动生成，仅清空上一只股票的内容
     if (opts.history) recordStockHistory(code, d.name);
     return true;
@@ -3332,6 +3334,219 @@ async function loadBoardRank() {
   }
 }
 
+/* ============================== 个股分析·资金流向与公告 ============================== */
+
+function renderFlow(d) {
+  const items = d.items || [];
+  const hint = $("#flow-hint"), status = $("#flow-status");
+  if (!items.length) { hint.textContent = "无资金流数据"; return; }
+  if (d.stale && status) status.textContent = "（网络异常，显示旧缓存）";
+  const c = mkChart("chart-flow");
+  const days = items.map((x) => x.day);
+  const main = items.map((x) => (x.main_net != null ? x.main_net / 1e8 : null));
+  const big = items.map((x) => (x.big_net != null ? x.big_net / 1e8 : null));
+  c.setOption({
+    backgroundColor: "transparent",
+    tooltip: { trigger: "axis", axisPointer: { type: "cross" },
+      valueFormatter: (v) => (v == null ? "-" : v.toFixed(2) + " 亿") },
+    legend: { data: ["主力净流入(亿)", "超大单(亿)", "收盘价"], textStyle: { color: "#8b98ab" }, top: 0 },
+    grid: { left: 56, right: 56, top: 30, bottom: 24 },
+    xAxis: { type: "category", data: days, axisLabel: { color: "#8b98ab" } },
+    yAxis: [
+      { type: "value", name: "亿元", axisLabel: { color: "#8b98ab" }, splitLine: { lineStyle: { color: "rgba(139,152,171,.12)" } } },
+      { type: "value", name: "价", axisLabel: { color: "#8b98ab" }, splitLine: { show: false } },
+    ],
+    series: [
+      { name: "主力净流入(亿)", type: "bar", data: main,
+        itemStyle: { color: (p) => (p.value >= 0 ? UP : DOWN) } },
+      { name: "超大单(亿)", type: "bar", data: big, barGap: "-100%", opacity: .45,
+        itemStyle: { color: (p) => (p.value >= 0 ? UP : DOWN) } },
+      { name: "收盘价", type: "line", yAxisIndex: 1, data: items.map((x) => x.close),
+        showSymbol: false, lineStyle: { color: ACCENT, width: 1.2 } },
+    ],
+  });
+  hint.textContent = `近 ${items.length} 日：最近一日主力净流入 ${
+    main[main.length - 1] != null ? main[main.length - 1].toFixed(2) + " 亿" : "—"}`;
+}
+
+async function loadFlow() {
+  if (!state.stockCode) return;
+  const code = state.stockCode;
+  try {
+    const d = await api("/api/flow?code=" + code);
+    if (state.stockCode === code) renderFlow(d);
+  } catch (err) {
+    const hint = $("#flow-hint");
+    if (hint) hint.textContent = "资金流数据不可用: " + err.message;
+  }
+}
+
+function renderAnnounce(d) {
+  const tbody = $("#ann-table tbody");
+  const status = $("#ann-status");
+  tbody.innerHTML = "";
+  const items = d.items || [];
+  if (d.stale && status) status.textContent = "（网络异常，显示旧缓存）";
+  if (!items.length) {
+    tbody.innerHTML = `<tr><td colspan="3" class="hint" style="padding:18px">近 180 日无公告记录</td></tr>`;
+    return;
+  }
+  for (const it of items.slice(0, 50)) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="white-space:nowrap">${escHtml(it.day)}</td>
+      <td>${escHtml(it.title)}</td>
+      <td>${it.url ? `<a href="${escHtml(it.url)}" target="_blank" rel="noopener">原文 ↗</a>` : "—"}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+async function loadAnnounce() {
+  if (!state.stockCode) return;
+  const code = state.stockCode;
+  try {
+    const d = await api("/api/announce?code=" + code);
+    if (state.stockCode === code) renderAnnounce(d);
+  } catch (err) {
+    const tbody = $("#ann-table tbody");
+    if (tbody) tbody.innerHTML =
+      `<tr><td colspan="3" class="hint" style="padding:18px">公告数据不可用: ${escHtml(err.message)}</td></tr>`;
+  }
+}
+
+/* ============================== 交易日记（记忆与复盘） ============================== */
+
+const JOURNAL = { code: "", loaded: false };
+
+function journalKindBadge(kind) {
+  const map = { trade: "交易", model: "信号", system: "系统" };
+  return `<span class="tag-hfq">${map[kind] || kind}</span>`;
+}
+
+async function loadJournal(code) {
+  JOURNAL.code = code || "";
+  const q = code ? "?code=" + encodeURIComponent(code) : "";
+  try {
+    const d = await api("/api/journal" + q);
+    renderJournalEvents(d.events || []);
+    renderJournalNotes(d.notes || []);
+    renderJournalReviews(d.reviews || []);
+    $("#journal-count").textContent =
+      `事件 ${d.events.length} · 笔记 ${d.notes.length} · 复盘 ${d.reviews.length}`;
+  } catch (err) {
+    toast("日记加载失败: " + err.message);
+  }
+}
+
+function renderJournalEvents(evs) {
+  const tbody = $("#journal-events-table tbody");
+  tbody.innerHTML = "";
+  if (!evs.length) {
+    tbody.innerHTML = `<tr><td colspan="5" class="hint" style="padding:18px">暂无事件——登记交易或等待盘后扫描自动写入</td></tr>`;
+    return;
+  }
+  for (const e of evs.slice(0, 100)) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="white-space:nowrap">${escHtml(e.day || "")}</td>
+      <td style="white-space:nowrap;color:var(--text-dim)">${escHtml((e.time || "").slice(11))}</td>
+      <td>${journalKindBadge(e.kind)}</td>
+      <td style="white-space:nowrap">${e.code ? `<a href="#stock" data-code="${escHtml(e.code)}" class="j-code">${escHtml(e.code)}</a>` : "—"}</td>
+      <td>${escHtml(e.text || "")}</td>`;
+    tbody.appendChild(tr);
+  }
+  tbody.querySelectorAll("a.j-code").forEach((a) =>
+    a.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      loadStock(a.dataset.code, { history: true });
+    }));
+}
+
+function renderJournalNotes(notes) {
+  const tbody = $("#journal-notes-table tbody");
+  tbody.innerHTML = "";
+  if (!notes.length) {
+    tbody.innerHTML = `<tr><td colspan="4" class="hint" style="padding:18px">还没有笔记——把观察/计划/教训记下来，LLM 复盘会引用它们</td></tr>`;
+    return;
+  }
+  for (const n of notes) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="white-space:nowrap">${escHtml(n.day || "")}</td>
+      <td style="white-space:nowrap">${escHtml(n.code || "—")}</td>
+      <td>${escHtml(n.text || "")}${n.edited ? ' <span class="hint">（已编辑）</span>' : ""}</td>
+      <td><button class="mini-btn j-note-del" data-id="${escHtml(n.id)}">删除</button></td>`;
+    tbody.appendChild(tr);
+  }
+  tbody.querySelectorAll(".j-note-del").forEach((b) =>
+    b.addEventListener("click", async () => {
+      try {
+        await apiPost("/api/journal", { action: "note_delete", id: b.dataset.id });
+        loadJournal(JOURNAL.code);
+      } catch (err) { toast(err.message); }
+    }));
+}
+
+function renderJournalReviews(reviews) {
+  const box = $("#journal-reviews");
+  box.innerHTML = "";
+  if (!reviews.length) {
+    box.innerHTML = `<div class="hint" style="padding:14px">暂无复盘——盘后更新会为每只自选股自动生成规则版复盘，也可在上方手动生成</div>`;
+    return;
+  }
+  for (const r of reviews.slice(0, 20)) {
+    const div = document.createElement("div");
+    div.className = "chart-box";
+    const lines = (r.lines || []).map((l) =>
+      `<li>[${escHtml(l.type)}] ${escHtml(l.text)}</li>`).join("");
+    const isLlm = r.version === "llm";
+    div.innerHTML = `
+      <div class="chart-title">
+        ${escHtml(r.day)} · ${escHtml(r.code)} · ${isLlm ? "LLM 复盘" : "规则复盘"}
+        <span class="hint">${escHtml(r.time || "")}</span>
+      </div>
+      ${isLlm ? mdToHtml(r.summary || "") : `<p>${escHtml(r.summary || "")}</p><ul class="j-lines">${lines}</ul>`}`;
+    box.appendChild(div);
+  }
+}
+
+async function journalReviewAction(action) {
+  const code = ($("#journal-review-code").value || "").trim().toUpperCase();
+  if (!code) { toast("请输入股票代码，如 300687.SZ"); return; }
+  if (!/^\d{6}\.(SH|SZ|BJ)$/.test(code)) { toast("代码格式应为 600519.SH"); return; }
+  const btn = $(action === "review_generate" ? "#journal-review-gen" : "#journal-review-llm");
+  btn.disabled = true;
+  try {
+    const d = await apiPost("/api/journal", { action, code });
+    if (d.ok) { toast("复盘已生成"); loadJournal(JOURNAL.code); }
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function bindJournal() {
+  $("#journal-refresh").addEventListener("click", () => loadJournal(JOURNAL.code));
+  $("#journal-note-add").addEventListener("click", async () => {
+    const code = ($("#journal-note-code").value || "").trim().toUpperCase() || null;
+    const text = ($("#journal-note-text").value || "").trim();
+    if (!text) { toast("笔记内容不能为空"); return; }
+    if (code && !/^\d{6}\.(SH|SZ|BJ)$/.test(code)) { toast("代码格式应为 600519.SH"); return; }
+    try {
+      await apiPost("/api/journal", { action: "note_add", code, text });
+      $("#journal-note-text").value = "";
+      loadJournal(JOURNAL.code);
+    } catch (err) { toast(err.message); }
+  });
+  $("#journal-review-gen").addEventListener("click", () => journalReviewAction("review_generate"));
+  $("#journal-review-llm").addEventListener("click", () => journalReviewAction("review_llm"));
+  $("#journal-search").addEventListener("change", () => {
+    const v = ($("#journal-search").value || "").trim().toUpperCase();
+    loadJournal(v && /^\d{6}/.test(v) ? v : "");
+  });
+}
+
 /* ============================== 框架 ============================== */
 
 function switchTab(name, opts = {}) {
@@ -3350,6 +3565,7 @@ function switchTab(name, opts = {}) {
   if (name === "market") { loadBoards(); loadRank(); }
   if (name === "stock") loadWatchlist();
   if (name === "trades") loadTradesPage();
+  if (name === "journal") loadJournal(JOURNAL.code);
   if (name === "inbox") loadInbox();
   if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
 }

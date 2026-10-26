@@ -120,6 +120,45 @@ _CONFIG = ai.AIConfig(base_url="https://example.test/v1", api_key="sk-test-secre
                       model="test-model", timeout=1)
 
 
+def _patch_extra_data():
+    """mock 新增数据面（资金流/公告/情绪）：避免测试触网，并保证 fingerprint 稳定。
+
+    ai.collect_context 通过「from .flow import latest_metrics」等延迟导入取数，
+    因此 patch 目标是各模块自身（首次导入发生在 collect_context 内部时同样生效）。
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        import analyzer.flow as flow_mod
+        import analyzer.announce as ann_mod
+        import analyzer.sentiment as sent_mod
+
+        with mock.patch.object(flow_mod, "latest_metrics",
+                               return_value={"available": True, "stale": False,
+                                             "last_day": "2026-10-22", "n_days": 5,
+                                             "main_net_sum": 1.23e8,
+                                             "main_net_days_inflow": 3,
+                                             "main_net_days_outflow": 2,
+                                             "last": {"day": "2026-10-22",
+                                                      "main_net": 4.5e7}}), \
+             mock.patch.object(ann_mod, "latest_titles",
+                               return_value={"available": True, "stale": False,
+                                             "n_total": 3,
+                                             "items": [{"day": "2026-10-21",
+                                                        "title": "测试公告"}]}), \
+             mock.patch.object(sent_mod, "latest_metrics",
+                               return_value={"available": True, "stale": False,
+                                             "n_days": 10, "last_day": "2026-10-22",
+                                             "last_score": 66.6, "score_mean": 65.0,
+                                             "score_chg_5d": 1.5,
+                                             "snapshot": {"day": "2026-10-22",
+                                                          "score": 66.6}}):
+            yield
+
+    return _ctx()
+
+
 def _write_brief(root, day="2026-10-22", status="有效", score="+35"):
     path = Path(root) / "news" / "us_market" / f"{day}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -187,7 +226,7 @@ def t_overseas_brief():
 
 
 def t_collect_context():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, _patch_extra_data():
         store = _FakeStore(tmp)
         runner = _FakeRunner(fail={"momentum"}, raise_={"risk_profile"})
         ctx, warns = ai.collect_context(store, runner, "600000.SH")
@@ -224,7 +263,7 @@ def t_collect_context():
 
 
 def t_fit_and_prompt():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, _patch_extra_data():
         ctx, warns = ai.collect_context(_FakeStore(tmp), _FakeRunner(), "600000.SH")
         for m in ctx["models"]:
             for i in range(60):
@@ -295,7 +334,7 @@ def t_chat_completion():
 
 
 def t_generate_cache():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, _patch_extra_data():
         store = _FakeStore(tmp)
         runner = _FakeRunner(fail={"momentum"})
         with mock.patch("analyzer.ai.requests.post") as post:

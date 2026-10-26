@@ -773,8 +773,7 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                         return self._json({"error": "当日无事件且无行情，无可复盘内容"}, 400)
                     try:
                         out = journal_mod.build_llm_review(j, code, day, review)
-                    except journal_mod.__dict__.get("AIError", RuntimeError) as e:  # noqa: BLE001
-                        # AIError 从 analyzer.ai 延迟导入，此处统一兜住
+                    except Exception as e:  # noqa: BLE001 AIError 也是 RuntimeError
                         return self._json({"error": str(e)}, getattr(e, "status", 502))
                     rec = j.add_review(day, code, out["report"], version="llm")
                     self._json({"ok": True, "review": rec, "usage": out.get("usage")})

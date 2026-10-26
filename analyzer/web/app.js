@@ -3998,6 +3998,7 @@ async function bootstrap() {
   $("#ai-generate").addEventListener("click", () => loadAI(false));
   $("#ai-refresh").addEventListener("click", () => loadAI(true));
   resetAIPanel();
+  bindJournal();
 
   // K线周期切换（时/日/周/月）：初始按钮态来自上次选择（localStorage）
   $$("#kline-freq button").forEach((b) =>

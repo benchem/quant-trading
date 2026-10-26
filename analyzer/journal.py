@@ -192,12 +192,14 @@ class Journal:
     # ------------------------------------------------ 事件（append-only）
 
     def add_event(self, ev: dict) -> dict:
-        if not _valid_event(ev):
-            raise ValueError("事件缺少必要字段（id 由 add_event 生成）")
+        if not isinstance(ev, dict) or not ev.get("kind") or not ev.get("code"):
+            raise ValueError("事件缺少必要字段（kind/code）")
         rec = dict(ev)
         rec.setdefault("id", _uid("ev"))
         rec.setdefault("time", _now())
         rec.setdefault("day", _day())
+        if not _valid_event(rec):
+            raise ValueError("事件字段不合法（kind 应为 trade/model/system）")
         return self._events.append(rec)
 
     def events(self, code: str | None = None, since_day: str | None = None,

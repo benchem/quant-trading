@@ -170,14 +170,18 @@ def _journal_targets(store, users, code: str) -> list[str | None]:
     return out
 
 
-def write_signal_events(store, hits: list[dict]) -> int:
+def write_signal_events(store, hits: list[dict], day: str | None = None) -> int:
     """信号扫描命中写入对应用户的 journal 事件流；返回写入条数。
 
     归属规则与 NotificationHub 一致：自选股包含该股的用户；多用户模式下
     无人自选则广播给全部用户（与站内信「不丢消息」语义对齐）。
+    day 给定时做当日去重（同日同股同插件的信号重跑只记一次）。
     """
+    import datetime as _dt
+
     from .journal import Journal, event_from_signal
 
+    day = day or _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8))).strftime("%Y-%m-%d")
     users = _journal_users(store)
     n = 0
     for h in hits:
@@ -187,7 +191,14 @@ def write_signal_events(store, hits: list[dict]) -> int:
             targets = list(users)  # 无人自选 -> 广播
         for u in targets:
             try:
-                Journal(store.root, u).add_event(event_from_signal(h))
+                j = Journal(store.root, u)
+                # 当日去重：同 (code, plugin) 已写过就跳过
+                dup = any(e.get("day") == day and e.get("code") == code
+                          and e.get("plugin") == h.get("plugin")
+                          for e in j.events(code=code, kind="model", limit=50))
+                if dup:
+                    continue
+                j.add_event(event_from_signal(h))
                 n += 1
             except Exception:  # noqa: BLE001 单用户失败不影响其余
                 continue
@@ -598,7 +609,7 @@ class EodUpdater:
                     level=h.get("level", "alert"), code=h["code"], desktop=True,
                     source="model", extra={"plugin": h["plugin"]})
             try:
-                write_signal_events(self.store, hits)
+                write_signal_events(self.store, hits, day)
             except Exception as e:  # noqa: BLE001 journal 旁路失败不阻塞
                 self._error(f"信号事件写入日记失败: {e}")
         with self._lock:

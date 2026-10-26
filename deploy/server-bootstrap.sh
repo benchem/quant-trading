@@ -114,6 +114,23 @@ systemctl restart quant-analyzer
 systemctl restart quant-planwatch
 echo "  服务已启动：quant-analyzer / quant-planwatch"
 
+# ---------- 4b. 盘前定时拉起 planwatch ----------
+# monitor 收盘(15:05)会正常退出（CLI 设计），Restart=on-failure 不会拉起它。
+# 每个工作日 09:10 CST 由 cron 启动一次：盘中保持运行，收盘再退出，循环往复。
+log "盘前定时任务 (cron)"
+if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled cron >/dev/null 2>&1; then
+    cat > /etc/cron.d/quant-planwatch <<'CRON'
+# quant-trading: 每个工作日 09:10 CST 拉起盯盘（收盘后 monitor 会自行退出）
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+10 9 * * 1-5 root /usr/bin/systemctl start quant-planwatch >> /var/log/quant-planwatch-cron.log 2>&1
+CRON
+    chmod 644 /etc/cron.d/quant-planwatch
+    echo "  已写入 /etc/cron.d/quant-planwatch（工作日 09:10 拉起盯盘）"
+else
+    echo "  [warn] 未检测到 cron，跳过盘前定时（请自行确保盯盘在交易时段运行）"
+fi
+
 # ---------- 5. 健康检查 ----------
 log "健康检查"
 sleep 3

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.compute as pc
 import pyarrow.dataset as pad
 
 from .minute import info as minute_info
@@ -88,6 +89,7 @@ class DataStore:
         self._chips_cache: dict[str, dict] = {}
         self._last_cache: dict[str, dict | None] = {}
         self._daily_cache: dict[str, pd.DataFrame | None] = {}
+        self._close_at_cache: dict[tuple, float | None] = {}
 
         # 多用户数据隔离：自选股/交易流水按用户分桶（data/users/{user}/），
         # 首次访问惰性加载；user=None 为「共享」单用户模式（serve --no-auth），
@@ -117,11 +119,23 @@ class DataStore:
         for k in self._stock_market.values():
             if k:
                 self._market_counts[k] = self._market_counts.get(k, 0) + 1
+        # 快照所属交易日（真实价折算锚点；日线比快照更旧时退化为日线最大日期）
+        snap = self._snapshot_date()
+        if snap is None and len(self.market):
+            snap = pd.Timestamp(self.market.index.max()).normalize()
+        self.snapshot_date = snap
+        # 最后一个「覆盖完整」的交易日：部分刷新日（如只刷了 533/5223 只）
+        # 的涨跌家数/成交额口径不完整，footer 的「数据截至」应指向最后全量日
+        last_full = self.market.index[~self.market["partial"]] if len(self.market) else pd.DatetimeIndex([])
+        self._last_full_day = last_full.max() if len(last_full) else None
         self.meta = {
             "n_stocks": int(self.basic.shape[0]),
             "date_min": str(self.market.index.min().date()),
             "date_max": str(self.market.index.max().date()),
-            "last_trade_date": str(self.market.index.max().date()),
+            "last_trade_date": str(self._last_full_day.date()) if self._last_full_day is not None
+            else str(self.market.index.max().date()),
+            "snapshot_date": str(self.snapshot_date.date()) if self.snapshot_date is not None else None,
+            "n_stocks_last_day": int(self.market["n_codes"].iloc[-1]) if len(self.market) else 0,
             "indexes": [
                 {"code": c, "name": INDEX_NAMES.get(c, c)} for c in sorted(self.indexes)
             ],
@@ -145,6 +159,7 @@ class DataStore:
         self._chips_cache.clear()
         self._last_cache.clear()
         self._daily_cache.clear()
+        self._close_at_cache.clear()
 
     def reload(self) -> dict:
         """数据落盘后重载启动数据并清空查询缓存，返回新 meta。"""
@@ -155,16 +170,70 @@ class DataStore:
     # ------------------------------------------------------------------ load
 
     def _load_basic(self) -> pd.DataFrame:
-        for name in ("dataset/stock_basic.parquet", "stock_list.parquet"):
-            p = self.root / name
-            if p.exists():
-                df = pd.read_parquet(p)
+        """基础信息（name/latest_price/市值/涨跌幅）：两个来源按落盘时间取新者。
+
+        - ``stock_list.parquet``：实时快照，`downloader` 的 list/base 阶段刷新
+          （含盘中刷新，mtime 新但可能未收盘）；
+        - ``dataset/stock_basic.parquet``：build_dataset 从 stock_list 复制的
+          归档副本（全量更新完成后刷新，口径更"整"）。
+
+        旧版固定优先 stock_basic，导致「只刷新了 stock_list/部分日线」时
+        （部分更新场景）全站取价仍停留在旧快照。现按 mtime 取新，
+        并把「快照所属交易日」记入 ``self.snapshot_date``（= 该股日线序列中
+        ≤ mtime 的最大交易日；无 mtime 信息或日线更早时退化为日线末根日期），
+        供 ``price_info`` 做 快照价×hfq收盘比 的跨日复权。
+        """
+        p_live = self.root / "stock_list.parquet"
+        p_arch = self.root / "dataset" / "stock_basic.parquet"
+        cands = [p for p in (p_live, p_arch) if p.exists()]
+        if not cands:
+            raise SystemExit(f"{self.root} 下未找到股票基础信息表")
+        try:
+            cands.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        except OSError:
+            pass
+        df, p, mday = None, None, None
+        # 按 mtime 从新到旧尝试：最新的文件可能正被非原子写入（半个 parquet），
+        # 读取失败时回退到旧文件，而不是让整个服务起不来
+        for cand in cands:
+            try:
+                df = pd.read_parquet(cand)
                 df = df.drop_duplicates("code").set_index("code")
                 for col in ("latest_price", "pct_chg", "total_mv", "float_mv"):
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
-                return df
-        raise SystemExit(f"{self.root} 下未找到股票基础信息表")
+                p = cand
+                try:
+                    mday = pd.Timestamp.fromtimestamp(cand.stat().st_mtime).tz_localize(None).normalize()
+                except (OSError, OverflowError, ValueError):
+                    mday = None
+                break
+            except Exception:  # noqa: BLE001  半写/损坏文件：试下一个来源
+                continue
+        if df is None:
+            raise SystemExit(f"{self.root} 下股票基础信息表均不可读: {[str(c) for c in cands]}")
+        self._basic_path = p
+        self._snapshot_mtime_day = mday
+        return df
+
+    def _snapshot_date(self) -> pd.Timestamp | None:
+        """快照所属交易日（近似 mtime→日，再回退到 ≤ 该日的最近交易日）；
+        日线数据可能比快照更旧（部分更新只刷了 stock_list）——price_info
+        的锚点日 = min(快照日, 日线末根日)，各自取各自可用范围，无需此处校正。"""
+        mday = getattr(self, "_snapshot_mtime_day", None)
+        if mday is None:
+            return None
+        if len(self.calendar):
+            c = self.calendar
+            if mday < c.min():
+                mday = c.min()
+            elif mday > c.max():
+                mday = c.max()
+            # 回退到 ≤ mday 的最近交易日（非交易日快照取前一日）
+            cands = c[c <= mday]
+            if len(cands):
+                mday = cands.max()
+        return mday
 
     def _load_board_members(self) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
         """板块成分表（downloader board 生成）；缺失返回 (None, None)（板块功能降级）。
@@ -223,17 +292,43 @@ class DataStore:
             out[code] = df
         return out
 
+    def _scan_daily_max_date(self) -> pd.Timestamp | None:
+        """pyarrow 扫描单股目录所有 bar 的最大日期（~0.7s/5千股），供滞后检测。"""
+        try:
+            ds = pad.dataset(self.daily_dir, format="parquet")
+            t = ds.to_table(columns=["date"])
+            m = pc.max(t["date"])
+            if m is None or m.is_valid is False or m.as_py() is None:
+                return None
+            return pd.Timestamp(m.as_py()).normalize()
+        except Exception:  # noqa: BLE001
+            return None
+
     def _build_market_daily(self) -> pd.DataFrame:
-        """全市场日度聚合：涨跌家数 / 等权收益 / 成交额 / 等权累计净值。"""
+        """全市场日度聚合：涨跌家数 / 等权收益 / 成交额 / 等权累计净值。
+
+        合并表 ``dataset/daily_hfq.parquet`` 由 EOD 的 build_dataset 阶段生成，
+        可能滞后于单股文件（部分刷新场景：只刷了部分股票的日线、还没跑
+        build_dataset）。这里先扫单股目录的最大日期，若比合并表新，
+        直接从单股目录聚合（4 列，~3.5s），保证「今日刚刷新的 K 线」
+        立即反映到市场页，而不是等下一次全量构建。
+
+        另加 ``n_codes``（当日有数据的股票数）：部分刷新日只有几百只股票，
+        涨跌家数/成交额口径不完整，``last_trade_date`` 应指向最后一个
+        「覆盖完整」的交易日，而不是把半截日当成全市场日。
+        """
         p = self.root / "dataset" / "daily_hfq.parquet"
         cols = ["date", "code", "close", "amount"]
+        t = None
         if p.exists():
             t = pd.read_parquet(p, columns=cols)
-        else:
-            # 兜底：用单股文件现场合并（较慢）
+        merged_max = pd.Timestamp(t["date"].max()).normalize() if t is not None and len(t) else None
+        live_max = self._scan_daily_max_date()
+        # 单股目录比合并表新（部分刷新）→ 从单股目录聚合，并做标记
+        self._market_from_stocks = bool(live_max and (merged_max is None or live_max > merged_max))
+        if t is None or self._market_from_stocks:
             files = list(self.daily_dir.glob("*.parquet"))
-            t = pd.concat((pd.read_parquet(f) for f in files), ignore_index=True)
-            t = t[["date", "code", "close", "amount"]]
+            t = pd.concat((pd.read_parquet(f, columns=cols) for f in files), ignore_index=True)
 
         t["date"] = pd.to_datetime(t["date"])
         t = t.sort_values(["code", "date"])
@@ -243,6 +338,7 @@ class DataStore:
         adv = (t["ret"] > 0).groupby(t["date"]).sum()
         dec = (t["ret"] < 0).groupby(t["date"]).sum()
         flat = (t["ret"] == 0).groupby(t["date"]).sum()
+        n_codes = t.groupby("date")["code"].nunique()
         # 等权均值/中位数对单日极端值（hfq 因子跳变、新股首日）做 ±100% 截断
         ret_clip = t["ret"].clip(-1.0, 1.0)
         mean_ret = ret_clip.groupby(t["date"]).mean()
@@ -254,11 +350,15 @@ class DataStore:
                 "adv": adv,
                 "dec": dec,
                 "flat": flat,
+                "n_codes": n_codes,
                 "mean_ret": mean_ret,
                 "med_ret": med_ret,
                 "amount_yi": amount / 1e8,  # 亿元
             }
         )
+        # 部分覆盖日：涨跌家数/成交额只含已刷新的股票，标记出来供展示层降级
+        full_n = int(n_codes.max()) if len(n_codes) else 0
+        m["partial"] = n_codes < full_n * 0.9
         m["nav_eqw"] = (1.0 + m["mean_ret"].fillna(0.0)).cumprod()
         m.index = m.index.normalize()
         m.index.name = "date"
@@ -382,11 +482,14 @@ class DataStore:
             if code in self.basic.index:
                 r = self.basic.loc[code]
                 lb = self.hfq_last(code)
+                pi = self.price_info(code)
                 m = minute_info(code)
                 out.append({
                     "code": code,
                     "name": str(r.get("name", code)),
-                    "latest_price": _r(r.get("latest_price")),
+                    # 展示价用统一真实价（快照价×hfq收盘比），与K线/持仓同口径；
+                    # pct_chg/total_mv 是快照日全市场值，保持快照口径
+                    "latest_price": pi["real"] if pi["real"] is not None else _r(r.get("latest_price")),
                     "pct_chg": _pct(r.get("pct_chg")),
                     "total_mv": _r(r.get("total_mv")),
                     "hfq_close": lb["close"] if lb else None,
@@ -459,9 +562,8 @@ class DataStore:
         df = self._daily(code)
         if df is None or df.empty:
             return info
-        real = _r(r.get("latest_price"))
-        hfq_last = _r(df["close"].iloc[-1])
-        factor = real / hfq_last if (real is not None and hfq_last) else None
+        info_p = self.price_info(code)
+        factor = info_p["factor"]
         closes = df["close"].astype(float)
         highs = df["high"].astype(float) if "high" in df else closes
         lows = df["low"].astype(float) if "low" in df else closes
@@ -893,14 +995,13 @@ class DataStore:
         }
 
     def positions(self, user: str | None) -> dict[str, dict]:
-        """某用户按代码汇总的持仓（最新价取基础信息表快照；无交易记录的代码不出现）。"""
+        """某用户按代码汇总的持仓（最新价用统一真实价 real_price；无交易记录的代码不出现）。"""
         by_code: dict[str, list[dict]] = {}
         for t in self.trades(user):
             by_code.setdefault(t["code"], []).append(t)
         out = {}
         for code, lst in by_code.items():
-            last_price = _r(self.basic.loc[code].get("latest_price")) if code in self.basic.index else None
-            out[code] = self.position_of(lst, last_price)
+            out[code] = self.position_of(lst, self.real_price(code))
         return out
 
     def search_stocks(self, q: str, limit: int = 30) -> list[dict]:
@@ -922,7 +1023,8 @@ class DataStore:
                 {
                     "code": code,
                     "name": str(r.get("name", code)),
-                    "latest_price": _r(r.get("latest_price")),
+                    # 统一真实价（与 K 线/持仓同口径）
+                    "latest_price": self.real_price(code),
                     "pct_chg": _pct(r.get("pct_chg")),
                     "total_mv": _r(r.get("total_mv")),
                     "hfq_close": lb["close"] if lb else None,
@@ -931,7 +1033,7 @@ class DataStore:
         return rows
 
     def hfq_last(self, code: str) -> dict | None:
-        """最近一根后复权 K 线 {date, close}（带缓存；真实价请用 basic.latest_price）。"""
+        """最近一根后复权 K 线 {date, close}（带缓存；真实价请用 price_info）。"""
         code = code.upper()
         if code in self._last_cache:
             return self._last_cache[code]
@@ -943,6 +1045,70 @@ class DataStore:
                 row = df.sort_values("date").iloc[-1]
                 out = {"date": str(row["date"])[:10], "close": _r(row["close"])}
         self._last_cache[code] = out
+        return out
+
+    # ------------------------------------------------- 统一真实价（取价唯一入口）
+
+    def price_info(self, code: str) -> dict:
+        """某股的统一「真实价」及其折算因子 —— 全站取价的唯一入口。
+
+        口径（与 K 线「最新价=真实价」的前复权等价）::
+
+            real_now  = 快照真实价 × hfq_close(最新收盘) / hfq_close(快照日收盘)
+            factor    = real_now / hfq_close(最新收盘)   # 乘到任意 hfq 价上
+
+        - 快照日 = ``self.snapshot_date``（stock_list 快照所属交易日）；
+        - 锚点日 = min(快照日, 该股日线末根日)；
+        - 日线末根 ≤ 快照日（常规：快照已含 K 线）→ factor = 快照价/hfq末根，
+          real_now = 快照价（与旧口径一致，K 线末根即真实价）；
+        - 日线末根 > 快照日（快照后只刷了 K 线）→ factor = 快照价/hfq快照日收盘，
+          real_now = 快照价 × hfq末根/hfq快照日收盘，把真实价外推到最新交易日。
+
+        返回 {real, factor, snap_date, last_date}；real/factor 可为 None
+        （无快照价或无 K 线）。同一进程内同一股结果一致（读同一快照与日线文件），
+        因此 kline/自选/持仓/筹码/排行 各处取价恒等。
+        """
+        code = code.upper()
+        lb = self.hfq_last(code)
+        snap_str = str(self.snapshot_date.date()) if self.snapshot_date is not None else None
+        real = _r(self.basic.loc[code, "latest_price"]) if code in self.basic.index else None
+        if real is None or lb is None or not lb["close"]:
+            return {"real": real, "factor": None,
+                    "snap_date": snap_str, "last_date": lb["date"] if lb else None}
+        anchor_date = lb["date"]
+        if snap_str and snap_str < lb["date"]:  # K 线比快照新：锚在快照日
+            anchor_date = snap_str
+        if anchor_date == lb["date"]:
+            anchor_close = lb["close"]
+        else:
+            anchor_close = self._hfq_close_at(code, anchor_date)
+        factor = real / anchor_close if anchor_close else None
+        real_now = lb["close"] * factor if factor else None
+        return {"real": real_now, "factor": factor,
+                "snap_date": snap_str, "last_date": lb["date"]}
+
+    def real_price(self, code: str) -> float | None:
+        """最新真实价（统一口径，见 price_info）。"""
+        return self.price_info(code)["real"]
+
+    def _hfq_close_at(self, code: str, date_str: str) -> float | None:
+        """某股指定交易日的 hfq 收盘（带小缓存；非交易日/缺文件返回 None）。"""
+        key = (code, date_str)
+        if key in self._close_at_cache:
+            return self._close_at_cache[key]
+        out = None
+        f = self.daily_dir / f"{code}.parquet"
+        if f.exists():
+            try:
+                df = pd.read_parquet(f, columns=["date", "close"])
+                row = df.loc[df["date"].astype(str).str[:10] == date_str]
+                if len(row):
+                    out = _r(row.iloc[-1]["close"])
+            except Exception:  # noqa: BLE001
+                out = None
+        if len(self._close_at_cache) > 512:
+            self._close_at_cache.clear()
+        self._close_at_cache[key] = out
         return out
 
     def kline(self, code: str, start: str | None = None, end: str | None = None) -> dict | None:
@@ -966,10 +1132,10 @@ class DataStore:
         if df.empty:
             return None
         basic_row = self.basic.loc[code] if code in self.basic.index else None
-        # 价格单位：按 最新真实价/后复权最新收盘 折算整条序列（等价于前复权，最新价=真实价）
-        real = _r(basic_row["latest_price"]) if basic_row is not None else None
+        # 价格单位：统一真实价折算（见 price_info）；整条序列 × factor，最新价=真实价
+        info = self.price_info(code)
+        real, factor = info["real"], info["factor"]
         hfq_last = _r(df["close"].iloc[-1])
-        factor = real / hfq_last if (real is not None and hfq_last) else None
         if factor:
             for col in ("open", "high", "low", "close"):
                 df[col] = df[col].astype(float) * factor
@@ -1250,9 +1416,9 @@ class DataStore:
         res = compute_chips(df, float_shares)
         stats = summarize(res["bins"], res["chips"], res["last_close"])
         total = res["chips"].sum()
-        # 与 kline 一致：按 最新真实价/后复权最新收盘 折算到前复权（真实价）单位
-        real = _r(self.basic.loc[code, "latest_price"]) if code in self.basic.index else None
-        factor = real / res["last_close"] if (real is not None and res["last_close"]) else None
+        # 与 kline 一致：统一真实价折算（见 price_info）
+        info = self.price_info(code)
+        factor = info["factor"]
         if factor:
             bins = [b * factor for b in res["bins"].tolist()]
             stats = {

@@ -355,14 +355,14 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                 elif path == "/api/trades":
                     code = (params.get("code") or "").upper() or None
                     ts = store.trades(user, code)
-                    # 附带股票名称/最新价快照，供交易记录页展示与浮动盈亏计算
+                    # 附带股票名称/最新价（统一真实价口径，与 K 线/自选一致）
                     meta = {}
                     for t in ts:
                         c = t["code"]
                         if c in meta or c not in store.basic.index:
                             continue
                         row = store.basic.loc[c]
-                        meta[c] = {"name": row.get("name"), "latest_price": _r(row.get("latest_price"))}
+                        meta[c] = {"name": row.get("name"), "latest_price": store.real_price(c)}
                     self._json({"code": code, "trades": ts, "meta": meta})
                 elif path == "/api/news":
                     code = (params.get("code") or "").upper()
@@ -975,6 +975,69 @@ def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765,
     updater.start()
     print(f"盘后自动更新: 已启用（每交易日 {updater.status['trigger']} CST 触发，"
           f"自选股优先刷新 + 信号提醒；POST /api/update/run 可手动触发）")
+
+    # 外部刷新监听：downloader/planwatch 等进程直接改 data/ 下的 parquet 时，
+    # 服务端不会自动感知（旧版要等 15:30 盘后更新或重启）。这里用 mtime 轮询
+    # （~20s 一次）：连续两次采样一致才 reload（save_parquet 非原子写，
+    # 避免读到半个文件），reload 失败下轮重试。
+    def _watch_data_changes(store_ref, runner_ref, interval: float = 20.0):
+        targets = [
+            store_ref.root / "stock_list.parquet",
+            store_ref.root / "dataset" / "stock_basic.parquet",
+            store_ref.root / "dataset" / "daily_hfq.parquet",
+            store_ref.root / "trade_calendar.parquet",
+        ]
+
+        def _snapshot():
+            out = {}
+            for p in targets:
+                try:
+                    out[str(p)] = p.stat().st_mtime
+                except OSError:
+                    out[str(p)] = None
+            # 单股日线目录：最大 mtime（部分刷新只有几百个文件变动，
+            # 逐文件 stat 5 千次 ~0.1s，可接受）
+            try:
+                out["__daily__"] = max(
+                    (f.stat().st_mtime for f in store_ref.daily_dir.glob("*.parquet")),
+                    default=None,
+                )
+            except OSError:
+                out["__daily__"] = None
+            return out
+
+        prev = _snapshot()
+
+        def _loop():
+            nonlocal prev
+            while True:
+                time.sleep(interval)
+                try:
+                    cur = _snapshot()
+                except Exception:  # noqa: BLE001
+                    continue
+                if cur == prev:
+                    continue
+                # 二次确认：间隔一个采样周期后仍认为写完，才 reload
+                time.sleep(5)
+                cur2 = _snapshot()
+                if cur2 != cur:
+                    prev = cur2
+                    continue
+                try:
+                    store_ref.reload()
+                    if runner_ref is not None:
+                        runner_ref.clear_cache()
+                    prev = cur2
+                    print(f"[watch] 检测到数据文件更新，已重载 ({time.strftime('%H:%M:%S')})")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[watch] 重载数据失败（下轮重试）: {e}")
+
+        th = threading.Thread(target=_loop, name="data-watcher", daemon=True)
+        th.start()
+        return th
+
+    _watch_data_changes(store, runner)
 
     # 昨夜美股简报邮件推送（借 iam 服务器 trending 项目的 email 渠道做法）：
     # 每工作日 08:40 CST 把 data/news/us_market/当日.md 渲染成 HTML 邮件推送；

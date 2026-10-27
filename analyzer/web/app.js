@@ -3206,7 +3206,7 @@ async function loadRankStocks() {
   try {
     const board = state.rankBoard ? `&board=${encodeURIComponent(state.rankBoard)}` : "";
     const market = state.rankMarket ? `&market=${state.rankMarket}` : "";
-    const r = await api(`/api/rank?start=${start}&end=${META.date_max}&metric=${metric}&n=${n}&asc=${asc}${board}${market}`);
+    const r = await api(`/api/rank?start=${start}&end=${META.last_trade_date || META.date_max}&metric=${metric}&n=${n}&asc=${asc}${board}${market}`);
     tbody.innerHTML = r.rows
       .map((row, i) => {
         const fmt = {
@@ -3295,7 +3295,7 @@ async function loadBoardRank() {
   const tbody = $("#board-table tbody");
   tbody.innerHTML = `<tr><td colspan="10" class="hint" style="padding:24px">加载中…</td></tr>`;
   try {
-    const r = await api(`/api/board_rank?start=${start}&end=${META.date_max}&metric=${metric}&n=${n}&asc=${asc}&type=${state.boardType}`);
+    const r = await api(`/api/board_rank?start=${start}&end=${META.last_trade_date || META.date_max}&metric=${metric}&n=${n}&asc=${asc}&type=${state.boardType}`);
     tbody.innerHTML = r.rows
       .map((row, i) => {
         const fmt = {
@@ -3955,7 +3955,9 @@ async function bootstrap() {
     return;
   }
   $("#meta-line").textContent =
-    `${META.n_stocks} 只股票 · ${META.date_min} ~ ${META.date_max} · 数据截至 ${META.last_trade_date}`;
+    `${META.n_stocks} 只股票 · ${META.date_min} ~ ${META.date_max} · 数据截至 ${META.last_trade_date}` +
+    (META.date_max !== META.last_trade_date
+      ? `（${META.date_max} 部分更新：${META.n_stocks_last_day} 只）` : "");
   $("#foot-range").textContent = `${META.date_min} ~ ${META.date_max}`;
 
   bindTabs();

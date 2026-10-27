@@ -182,6 +182,45 @@ def t_mark_read_scoped_by_source():
     assert nc.list(source="trade")["counts"]["by_source"]["trade"]["unread"] == 1
 
 
+def t_mark_read_persists_across_restart():
+    """回归：已读必须落盘。此前 mark_read 只改内存，analyzer 重启后 _load 从
+    JSONL 恢复（一律 read=False），已读消息全部被打回未读。"""
+    d = _tmp()
+    nc = NotificationCenter(d)
+    r1 = nc.push("m:1", "信号1", source="model", day="2026-10-27")
+    r2 = nc.push("t:1", "提醒1", source="trade", day="2026-10-27")
+    assert nc.mark_read([r1["id"]]) == 1
+    # 新实例模拟 analyzer 重启后从磁盘重建
+    nc2 = NotificationCenter(d)
+    msgs = {m["id"]: m for m in nc2.list()["messages"]}
+    assert msgs[r1["id"]]["read"] is True
+    assert msgs[r2["id"]]["read"] is False
+    assert nc2.list()["unread"] == 1
+    # 全部已读同样落盘
+    assert nc2.mark_read(all=True) == 1
+    assert NotificationCenter(d).list()["unread"] == 0
+
+
+def t_mark_read_syncs_tail_and_persists():
+    """mark_read 前先拉齐其它进程追加的尾部行：全部已读不漏新消息，
+    且重写不丢该行（tail 同步 + 落盘联动）。"""
+    d = _tmp()
+    nc = NotificationCenter(d)
+    nc.push("m:1", "旧消息", source="model", day="2026-10-27")
+    # 模拟另一进程（planwatch CLI）直接向文件追加一条新消息
+    other = {"id": "ext1", "key": "trade:2026-10-27:x", "code": None,
+             "level": "info", "text": "外部追加", "read": False,
+             "time": _now(), "day": "2026-10-27", "source": "trade"}
+    with open(d / "notifications.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(other, ensure_ascii=False) + "\n")
+    # 本进程尚未 tail 同步就直接「全部已读」
+    assert nc.mark_read(all=True) == 2
+    out = NotificationCenter(d).list()
+    assert out["counts"]["total"] == 2
+    assert out["unread"] == 0
+    assert all(m["read"] for m in out["messages"])
+
+
 def t_clear_by_source():
     d = _tmp()
     nc = NotificationCenter(d)
@@ -261,6 +300,8 @@ def main():
         ("跨进程尾部同步 tail", t_cross_process_tail_sync),
         ("自身 push 不重复消费", t_self_push_not_duplicated_on_sync),
         ("按来源标记已读", t_mark_read_scoped_by_source),
+        ("已读落盘-重启不回退", t_mark_read_persists_across_restart),
+        ("已读前同步尾部并落盘", t_mark_read_syncs_tail_and_persists),
         ("按来源清空", t_clear_by_source),
         ("get_inbox 进程级单例", t_get_inbox_singleton),
         ("analyzer.notify shim 同类型", t_analyzer_shim_identity),

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -228,18 +229,28 @@ class NotificationCenter:
 
     def mark_read(self, ids: list[str] | None = None, all: bool = False,
                   source: str | None = None) -> int:
-        """标记已读；ids=None 且 all=True 时全部（或指定 source 全部）已读。返回标记条数。"""
+        """标记已读；ids=None 且 all=True 时全部（或指定 source 全部）已读。返回标记条数。
+
+        标记结果必须立即写回 JSONL：已读态若只改内存，analyzer 重启后 _load
+        从磁盘恢复（一律 read=False）时，会把已读消息全部打回未读。
+        """
         with self._lock:
+            # 先增量拉齐其它进程（planwatch CLI）刚追加到文件尾部的行，
+            # 既让「全部已读」不漏新消息，也避免随后 _rewrite 覆盖丢消息。
+            self._sync_locked()
             n = 0
+            want = set(ids) if ids else None
             for it in self._items:
                 if it.get("read"):
                     continue
-                if ids and it["id"] in set(ids):
+                if want and it["id"] in want:
                     it["read"] = True
                     n += 1
                 elif all and (source is None or it.get("source", "system") == source):
                     it["read"] = True
                     n += 1
+            if n:
+                self._rewrite()
             return n
 
     def clear(self, before_day: str | None = None, source: str | None = None) -> int:
@@ -260,12 +271,24 @@ class NotificationCenter:
             return removed
 
     def _rewrite(self) -> None:
-        """把内存全量写回 JSONL（compact；调用方需持锁）。"""
+        """把内存全量写回 JSONL（调用方需持锁）。
+
+        临时文件 + os.replace 原子替换：避免另一进程的 tail 同步读到写了一半
+        的文件。写完把 _off 同步到新文件大小（按写入字节数，而非事后 stat——
+        若此刻其它进程刚好追加，宁可下次多消费一次，也不能跳过未读的行），
+        否则 _sync_locked 会因 size < _off 误判「文件被截断」而全量重读。
+        """
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as fh:
+            tmp = self.path.with_suffix(".jsonl.tmp")
+            written = 0
+            with open(tmp, "w", encoding="utf-8") as fh:
                 for it in self._items:
-                    fh.write(json.dumps(it, ensure_ascii=False) + "\n")
+                    line = json.dumps(it, ensure_ascii=False) + "\n"
+                    fh.write(line)
+                    written += len(line.encode("utf-8"))
+            os.replace(tmp, self.path)
+            self._off = written
         except OSError:
             pass
 

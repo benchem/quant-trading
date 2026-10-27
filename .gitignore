@@ -11,3 +11,6 @@ watchlog/
 deploy.env
 .env
 .deploy/
+.dsh/
+plan_*.json
+trading_plan_*.md

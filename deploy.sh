@@ -23,10 +23,10 @@
 set -euo pipefail
 
 # ================= 部署配置（按需修改） =================
-# 优先用内网直连（稳定）；若从外网部署，改用网关转发：
-#   SSH_HOST="root@quant.example.com"; SSH_PORT="5029"
-SSH_HOST="root@10.0.0.66"
-SSH_PORT="22"
+# 默认内网直连；外网/内网路由不通时用环境变量覆盖走网关：
+#   SSH_HOST="root@quant.example.com" SSH_PORT="5029" ./deploy.sh
+SSH_HOST="${SSH_HOST:-root@10.0.0.66}"
+SSH_PORT="${SSH_PORT:-22}"
 REMOTE_DIR="/opt/quant-trading"
 APP_HOST="0.0.0.0"          # 0.0.0.0 = 公网可访问（靠自带多用户登录鉴权）
 APP_PORT="8765"

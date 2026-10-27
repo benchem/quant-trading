@@ -171,8 +171,38 @@ plan_300687.json                    # 机器可读的投资计划（关键位/�
 watchlog/                           # 盯盘运行时产物（持仓/流水/提醒/日报，已 gitignore）
 analyzer/                           # 股票分析工具（交互式仪表盘 + 静态报告）
 analyzer/output/                    # report 模式 PNG 输出（已 gitignore）
+ analyzer/agent/                     # 智能体层（进化区）：prompt/LLM 调用/上下文组装，
+                                     #   见「软件架构与分层契约」；换模型/改措辞只动这里
 stock_analysis/                     # 插件式个股分析框架（多人并行开发分析模块）
 ```
+
+## 软件架构与分层契约
+
+代码分三层，依赖**只能向下**，由 `tests/test_architecture.py` 静态扫描
+（AST import 分析）机器强制，违反即测试失败：
+
+```
+数据面        datastore / news / valuation / flow / announce / sentiment / overseas
+              （行情·资讯抓取与缓存，TTL/降级/原子写）
+   ↑ 被依赖
+模型/规则面   stock_analysis（量化插件）/ journal（记忆与复盘规则）/ updates（EOD 流程）
+              / report / notify —— 纯确定性逻辑，零 LLM、零"进化"
+   ↑ 被依赖
+智能体面      analyzer/agent/ —— 唯一允许碰 LLM 的包（进化区）
+              llm.py 传输配置 · prompts.py prompt 文本+版本 · context.py 组装策略
+              analysis.py 报告入口+缓存 · review.py LLM 复盘
+```
+
+- **隔离的意义**：智能体能力（换模型、改 prompt、加数据源进上下文）频繁进化；
+  规则/模型面必须稳定。LLM 升级**不改任何规则代码**——规则版复盘在 LLM 不可用
+  时照常工作，journal 不 import agent 包；
+- **接线点**：`analyzer/server.py` 是组合根（唯一同时引用两层的模块）；
+  `analyzer/ai.py` 为旧 import 路径保留的兼容壳（re-export agent 包），新代码
+  请直接 `from analyzer.agent import …`；
+- **新增 LLM 能力**：模板加 `agent/prompts.py`（递增 `*_PROMPT_VERSION` 使缓存
+  失效），调用逻辑进 agent 包内对应文件；**不要**在规则面 import agent；
+- **新增数据源进 AI 上下文**：数据面加模块（仿 flow.py），策略在
+  `agent/context.py` 里接线——prompt 与传输层不动。
 
 ## 数据字典（日线字段）
 

@@ -227,17 +227,21 @@ def t_pusher_idempotent_and_retry():
         sent = []
         op.send_mail = lambda c, s, h, text_body=None: sent.append(s) or \
             {"ok": True, "to": c.mail_to, "dry_run": False}
-        r = p.push_once(source="manual")
+        # 显式锚定日期/时刻，避免依赖"今天"（fixture 简报写死 2026-10-26）
+        r = p.push_once(source="manual", on_date=dt.date(2026, 10, 26),
+                        now=dt.datetime(2026, 10, 26, 8, 41, tzinfo=CST))
         assert r["ok"] and len(sent) == 1
         assert notifier.items and notifier.items[-1]["level"] == "ok"
 
         # 2) 当日重复推送 -> 幂等跳过
-        r = p.push_once(source="manual")
+        r = p.push_once(source="manual", on_date=dt.date(2026, 10, 26),
+                        now=dt.datetime(2026, 10, 26, 8, 42, tzinfo=CST))
         assert r.get("skipped") and len(sent) == 1
 
         # 3) 状态文件持久化：新实例（模拟重启）也不会重发
         p2 = OverseasBriefPusher(tmp, cfg, push_hour=8, push_minute=40)
-        r = p2.push_once(source="schedule")
+        r = p2.push_once(source="schedule", on_date=dt.date(2026, 10, 26),
+                         now=dt.datetime(2026, 10, 26, 8, 43, tzinfo=CST))
         assert r.get("skipped") and len(sent) == 1
         day = "2026-10-26"
         # attempts 保持首次推送的计数（跳过不额外计数）

@@ -621,16 +621,16 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
             code = (req.get("code") or "").upper()
             if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
                 return self._json({"error": "code 格式应为 600519.SH"}, 400)
-            from . import ai as ai_mod
+            from .agent import AIConfig, AIError, generate
 
-            config = ai_mod.AIConfig.from_env()
+            config = AIConfig.from_env()
             if not config.enabled:
                 return self._json({"error": "AI 分析未配置：请在服务端设置环境变量 "
                                             "AI_API_KEY（可选 AI_BASE_URL / AI_MODEL）后重启 analyzer"}, 503)
             try:
-                self._json(ai_mod.generate(store, runner, code,
-                                           refresh=bool(req.get("refresh")), config=config))
-            except ai_mod.AIError as e:
+                self._json(generate(store, runner, code,
+                                    refresh=bool(req.get("refresh")), config=config))
+            except AIError as e:
                 return self._json({"error": str(e)}, e.status)
             except Exception:
                 traceback.print_exc()
@@ -721,9 +721,14 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                 self._json({"error": str(e)}, 400)
 
         def _post_journal(self, user: str | None):
-            """交易日记（按用户隔离）：笔记 CRUD + 复盘生成（规则版/LLM 版）。"""
+            """交易日记（按用户隔离）：笔记 CRUD + 复盘生成（规则版/LLM 版）。
+
+            规则版来自 journal（纯规则面）；LLM 版来自 agent（进化区）——
+            server 是组合根，是唯一同时接线两层的地方。
+            """
             from . import journal as journal_mod
             from .journal import Journal
+            from .agent import build_llm_review
 
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -772,7 +777,7 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                     if review is None:
                         return self._json({"error": "当日无事件且无行情，无可复盘内容"}, 400)
                     try:
-                        out = journal_mod.build_llm_review(j, code, day, review)
+                        out = build_llm_review(j, code, day, review)
                     except Exception as e:  # noqa: BLE001 AIError 也是 RuntimeError
                         return self._json({"error": str(e)}, getattr(e, "status", 502))
                     rec = j.add_review(day, code, out["report"], version="llm")
@@ -947,7 +952,7 @@ def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765,
     except Exception as e:  # 插件框架缺失/损坏不阻塞仪表盘主功能
         print(f"警告: 插件分析不可用（{e}），/api/plugins* 将返回 503")
 
-    from .ai import AIConfig
+    from .agent import AIConfig
 
     ai_cfg = AIConfig.from_env()
     if ai_cfg.enabled:

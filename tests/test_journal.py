@@ -185,9 +185,11 @@ def t_build_daily_review():
 
 
 def t_llm_review_prompt_guard():
-    """LLM 复盘：未配置 key 时报 AIError（不触网）。"""
-    from analyzer.ai import AIConfig
-    from analyzer.journal import build_llm_review
+    """LLM 复盘：未配置 key 时报 AIError（不触网）。
+
+    build_llm_review 已迁至智能体层 analyzer.agent（journal 保持纯规则面）。
+    """
+    from analyzer.agent import AIConfig, build_llm_review
 
     with tempfile.TemporaryDirectory() as tmp:
         j = Journal(tmp, None)

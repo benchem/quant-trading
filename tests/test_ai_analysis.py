@@ -373,7 +373,7 @@ def t_generate_cache():
                      "risk_view": "偏多", "confidence": "中",
                      "headlines": ["半导体领涨"], "watchlist_mapping": [],
                      "message": "当日海外信号有效"}
-            with mock.patch("analyzer.ai.load_daily_brief", return_value=valid):
+            with mock.patch("analyzer.agent.context.load_daily_brief", return_value=valid):
                 r5 = ai.generate(store, runner, "600000.SH", config=_CONFIG)
             assert r5["cached"] is False and post.call_count == 4
             assert r5["context_meta"]["overseas_status"] == "valid"

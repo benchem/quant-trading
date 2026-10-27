@@ -90,6 +90,10 @@ class DataStore:
         self._last_cache: dict[str, dict | None] = {}
         self._daily_cache: dict[str, pd.DataFrame | None] = {}
         self._close_at_cache: dict[tuple, float | None] = {}
+        # 本地 parquet 派生数据（财报摘要 / 分钟线概况）的 mtime 失效缓存：
+        # 自选列表每次刷新都会逐股调用，避免每请求都整表重读磁盘。
+        self._fund_cache: dict[str, tuple[int, dict | None]] = {}
+        self._minute_info_cache: dict[str, tuple[int, dict | None]] = {}
 
         # 多用户数据隔离：自选股/交易流水按用户分桶（data/users/{user}/），
         # 首次访问惰性加载；user=None 为「共享」单用户模式（serve --no-auth），
@@ -160,6 +164,8 @@ class DataStore:
         self._last_cache.clear()
         self._daily_cache.clear()
         self._close_at_cache.clear()
+        self._fund_cache.clear()
+        self._minute_info_cache.clear()
 
     def reload(self) -> dict:
         """数据落盘后重载启动数据并清空查询缓存，返回新 meta。"""
@@ -483,7 +489,7 @@ class DataStore:
                 r = self.basic.loc[code]
                 lb = self.hfq_last(code)
                 pi = self.price_info(code)
-                m = minute_info(code)
+                m = self.minute_info(code)
                 out.append({
                     "code": code,
                     "name": str(r.get("name", code)),
@@ -502,11 +508,30 @@ class DataStore:
         return out
 
     def fund_latest(self, code: str) -> dict | None:
-        """最新报告期财报完整摘要（仅读本地缓存，不发网络请求；无缓存返回 None）。"""
+        """最新报告期财报完整摘要（仅读本地缓存，不发网络请求；无缓存返回 None）。
+
+        结果按文件 (mtime_ns ^ size) 失效缓存：自选列表每次刷新都会
+        逐股调用本方法，缓存后同一进程内不再重复整表读盘。
+        """
         code = code.upper()
         f = self.root / "fundamental" / f"{code}.parquet"
-        if not f.exists():
+        try:
+            st = f.stat()
+            stamp = st.st_mtime_ns ^ st.st_size
+        except OSError:
+            self._fund_cache.pop(code, None)
             return None
+        hit = self._fund_cache.get(code)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        out = self._fund_read(f)
+        self._fund_cache[code] = (stamp, out)
+        if len(self._fund_cache) > 256:
+            self._fund_cache.pop(next(iter(self._fund_cache)), None)
+        return out
+
+    @staticmethod
+    def _fund_read(f: Path) -> dict | None:
         try:
             df = pd.read_parquet(f)
         except Exception:  # noqa: BLE001
@@ -541,6 +566,28 @@ class DataStore:
             "net_margin": g("net_margin"),
             "debt_ratio": g("debt_ratio"),
         }
+
+    def minute_info(self, code: str) -> dict | None:
+        """自选股本地分钟线概况（{bars, first, last}），按文件 mtime 失效缓存。
+
+        watchlist() 每次刷新对每只自选股都会取一次，缓存后避免重复整表读盘。
+        """
+        code = code.upper()
+        f = self.root / "minute" / "1" / f"{code}.parquet"
+        try:
+            st = f.stat()
+            stamp = st.st_mtime_ns ^ st.st_size
+        except OSError:
+            self._minute_info_cache.pop(code, None)
+            return None
+        hit = self._minute_info_cache.get(code)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        out = minute_info(code, self.root)
+        self._minute_info_cache[code] = (stamp, out)
+        if len(self._minute_info_cache) > 256:
+            self._minute_info_cache.pop(next(iter(self._minute_info_cache)), None)
+        return out
 
     def stock_info(self, code: str) -> dict | None:
         """个股信息（仅本地数据）：流通市值/换手率/52周高低/年初至今/一年涨跌幅。
@@ -593,8 +640,11 @@ class DataStore:
         df = None
         if f.exists():
             try:
+                # 只读 schema 判列（避免为探测列名而整表读一遍）
+                import pyarrow.parquet as ppq
+
                 cols = [c for c in ("date", "high", "low", "close")
-                        if c in pd.read_parquet(f).columns]
+                        if c in ppq.read_schema(f).names]
                 df = pd.read_parquet(f, columns=cols)
                 df["date"] = pd.to_datetime(df["date"])
                 df = df.sort_values("date")

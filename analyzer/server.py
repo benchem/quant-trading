@@ -1,6 +1,7 @@
 """本地 HTTP 服务：静态仪表盘 + JSON API（纯标准库，无额外依赖）。"""
 from __future__ import annotations
 
+import gzip
 import json
 import mimetypes
 import re
@@ -8,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -17,6 +19,35 @@ from .datastore import DataStore, _f, _r, _UNSET
 from .notify import NotificationHub
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+
+
+def _static_cache_control(rel: str) -> str:
+    """静态资源缓存策略（无内容哈希文件名，靠 ETag 协商保正确性）：
+
+    - ``/static/*``：第三方库（echarts 等），版本固定极少更新 → 可缓存 24h；
+    - ``index.html`` / ``app.js`` / ``style.css``：每次部署都可能变
+      → ``no-cache`` = 浏览器本地留存副本，每次使用前回源协商，
+      未变时 304 零重传（既新鲜又不重复传 1MB）。
+    """
+    if rel.startswith("static/"):
+        return "public, max-age=86400"
+    return "no-cache"
+
+
+# gzip 压缩阈值与压缩类型（图片/已压缩数据不压，纯文本收益 3~4 倍）
+_GZIP_MIN = 1024
+_GZIP_TYPES = {"text/html", "text/css", "application/javascript",
+               "application/json", "image/svg+xml"}
+
+
+def _gzip_bytes(body: bytes) -> bytes:
+    """标准库 gzip 压缩（level 6：文本场景接近 -9 的压缩率，耗时约一半）。"""
+    import io
+
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6) as gz:
+        gz.write(body)
+    return buf.getvalue()
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -92,16 +123,21 @@ class _AutoReloadRunner:
                 ctx.clear_cache()
 
 
-def _safe_static(path: str) -> Path | None:
-    """防目录穿越地解析静态文件路径。"""
-    if path == "/" or path == "":
-        p = WEB_DIR / "index.html"
-    else:
-        rel = path.lstrip("/")
-        p = (WEB_DIR / rel).resolve()
-        if not str(p).startswith(str(WEB_DIR.resolve())):
-            return None
-    return p if p.is_file() else None
+def _safe_static(path: str):
+    """防目录穿越地解析静态文件路径。
+
+    返回 ``(Path, rel)``：rel 为相对 web 目录的路径（缓存策略依据，如
+    ``static/echarts.min.js``）；越界或不存在时返回 ``(None, "")``。
+    """
+    if path in ("/", ""):
+        return WEB_DIR / "index.html", "index.html"
+    rel = path.lstrip("/")
+    p = (WEB_DIR / rel).resolve()
+    if not str(p).startswith(str(WEB_DIR.resolve())):
+        return None, ""
+    if not p.is_file():
+        return None, ""
+    return p, rel
 
 
 def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, updater=None,
@@ -127,7 +163,12 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
             pass
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "ashare-analyzer/1.0"
+        server_version = "ashare-analyzer/1.1"
+        # HTTP/1.1 + keep-alive：浏览器复用 TCP 连接（_send 恒设 Content-Length，
+        # 含 304 分支按 RFC 不带 body/Content-Length，连接分帧不受影响）。
+        protocol_version = "HTTP/1.1"
+        # 空闲 keep-alive 连接回收上限（浏览器通常自行先关，超时仅兜底防线程堆积）
+        timeout = 120
 
         def log_message(self, fmt, *args):  # 精简日志
             sys.stderr.write(
@@ -136,15 +177,35 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
 
         # ------------------------------------------------------------ helpers
 
-        def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
+        def _accepts_gzip(self) -> bool:
+            """客户端 Accept-Encoding 是否接受 gzip（q>0 才算）。"""
+            for part in (self.headers.get("Accept-Encoding") or "").split(","):
+                m = re.match(r"\s*([a-z*]+)\s*(?:;\s*q=([0-9.]+))?\s*$", part, re.I)
+                if m and m.group(1).lower() == "gzip":
+                    q = m.group(2)
+                    return True if q is None else float(q) > 0
+            return False
+
+        def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None,
+                  cache: str = "no-store"):
+            """统一发响应：文本类且客户端接受时 gzip 传输，缓存头由调用方指定。"""
+            headers = dict(extra or {})
+            base_type = ctype.split(";")[0].strip().lower()
+            if (len(body) >= _GZIP_MIN and base_type in _GZIP_TYPES
+                    and self._accepts_gzip()):
+                gz = _gzip_bytes(body)
+                if len(gz) < len(body):
+                    body = gz
+                    headers.setdefault("Content-Encoding", "gzip")
+                    headers.setdefault("Vary", "Accept-Encoding")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
             if getattr(self, "_pending_cookie", None):
                 self.send_header("Set-Cookie", self._pending_cookie)
                 self._pending_cookie = None
-            for k, v in (extra or {}).items():
+            for k, v in headers.items():
                 self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
@@ -159,6 +220,46 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
             parsed = urlparse(raw.decode("utf-8", "replace"))
             q = parsed.query
             return {k: v[-1] for k, v in parse_qs(q, encoding="utf-8").items()}
+
+        # ------------------------------------------------------ 静态资源（协商缓存）
+
+        def _not_modified(self, etag: str, last_mod: str) -> bool:
+            """条件请求检查：If-None-Match 优先于 If-Modified-Since（RFC 9110 §13.1.2）。"""
+            inm = self.headers.get("If-None-Match")
+            if inm:
+                tags = [t.strip() for t in inm.split(",")]
+                return etag in tags or "*" in tags
+            ims = self.headers.get("If-Modified-Since")
+            if ims:
+                try:
+                    return parsedate_to_datetime(last_mod) <= parsedate_to_datetime(ims)
+                except (TypeError, ValueError):
+                    return False
+            return False
+
+        def _serve_static(self, p: Path, rel: str) -> None:
+            """静态文件：ETag/Last-Modified 协商缓存 + gzip。
+
+            资源未变时回 304（不带 body），刷新页面不再重传 echarts/app.js。"""
+            try:
+                st = p.stat()
+            except OSError:
+                return self._json({"error": "not found"}, 404)
+            etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+            last_mod = formatdate(st.st_mtime, usegmt=True)
+            cache = _static_cache_control(rel)
+            if self._not_modified(etag, last_mod):
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Last-Modified", last_mod)
+                self.send_header("Cache-Control", cache)
+                self.send_header("Vary", "Accept-Encoding")
+                self.end_headers()
+                return
+            ctype = CONTENT_TYPES.get(p.suffix, "application/octet-stream")
+            self._send(200, p.read_bytes(), ctype,
+                       extra={"ETag": etag, "Last-Modified": last_mod},
+                       cache=cache)
 
         # --------------------------------------------------------- 鉴权
 
@@ -891,11 +992,10 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                 if user is None and auth is not None:
                     return
                 return self._api(path, self._params(), user)
-            p = _safe_static(path)
+            p, rel = _safe_static(path)
             if p is None:
                 return self._json({"error": "not found"}, 404)
-            ctype = CONTENT_TYPES.get(p.suffix, "application/octet-stream")
-            return self._send(200, p.read_bytes(), ctype)
+            return self._serve_static(p, rel)
 
     return Handler
 

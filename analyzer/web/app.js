@@ -4094,10 +4094,12 @@ async function bootstrap() {
     if (e.key === "Escape") hideTradesForm();
   });
 
+  // 市场概览与自选列表并行拉取（两者互不依赖）：刷新首屏串行 RTT 减半
+  const wlReady = loadWatchlist();   // 自选列表决定个股分析页默认展示的股票
   await loadMarket();
   loadBoards();
   loadRank();   // 市场页（含排行榜）为默认页，启动即加载
-  await loadWatchlist();   // 自选列表决定个股分析页默认展示的股票
+  await wlReady;
   // 个股分析页默认显示第一只自选股；无自选或加载失败时回退到预设第一只
   const firstCode = state.watchlist.length ? state.watchlist[0].code : null;
   if (!firstCode || !(await pickStock(firstCode))) {

@@ -86,6 +86,37 @@ def _make_rotator():
         return None
 
 
+#: A股收盘截止时刻：K线写入时刻早于该值且与K线同日 → 视为「盘中写入」。
+#: 15:00 收盘集合竞价结束，数据源当日 bar 通常 15:00-15:01 落定，留 5 分钟余量。
+CLOSE_CUTOFF = dt.time(15, 5)
+
+
+def _safe_mtime(path: Path) -> Optional[float]:
+    """文件 mtime（epoch 秒）；不存在/不可读返回 None。"""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _written_intraday(last: pd.Timestamp, mtime: Optional[float]) -> bool:
+    """最后一根 K 线是否为「盘中写入」：写入时刻与 K 线同日、且早于收盘截止。
+
+    盘中部分更新/补跑会把当日未收盘的 bar 写进本地文件；收盘后的增量更新
+    若直接按「最后日期+1」判定为已是最新，当日真实收盘价将永远缺失
+    （2026-10-27 事故：约 1975 只股票整天停留在盘中价，自选股信号扫描
+    全部基于错误收盘）。mtime 统一按 Asia/Shanghai 判日，服务器时区
+    不是 CST 时依然正确。
+    """
+    if mtime is None:
+        return False
+    try:
+        mt = pd.Timestamp(mtime, unit="s", tz="UTC").tz_convert("Asia/Shanghai")
+    except Exception:  # noqa: BLE001 时区/数值异常时按「无法判定」处理
+        return False
+    return mt.date() == last.date() and mt.time() < CLOSE_CUTOFF
+
+
 _STAT_LABEL = {
     "new": "新下载",
     "updated": "增量更新",
@@ -115,6 +146,14 @@ class Downloader:
     def refresh_stock_list(self) -> pd.DataFrame:
         df = with_retry(source.fetch_stock_list, desc="股票列表")
         store.save_parquet(store.stock_list_path(self.data_dir), df)
+        # dataset/stock_basic 归档副本同步刷新：原实现只在 build_dataset（EOD
+        # 第 7 阶段）里复制，而 EOD 全链路经常在"全市场日线"阶段卡死重启，
+        # 副本一滞后就是好几天，依赖它的路径看不到新上市股票（2026-10-27）。
+        # 内容与 stock_list 完全一致，DataStore 按 mtime 取新者，行为不变。
+        try:
+            store.save_parquet(store.dataset_dir(self.data_dir) / "stock_basic.parquet", df)
+        except Exception as e:  # noqa: BLE001 副本失败不影响主列表
+            _log(f"警告: dataset/stock_basic 副本写入失败: {e}")
         _log(f"股票列表已刷新: {len(df)} 只 -> {store.stock_list_path(self.data_dir)}")
         return df
 
@@ -217,17 +256,27 @@ class Downloader:
         return s.max()
 
     # ------------------------------------------------ A股日线
-    def _next_start(self, old, end: str, full: bool, incremental_ok: bool) -> tuple[str, str]:
+    def _next_start(self, old, end: str, full: bool, incremental_ok: bool,
+                    mtime: Optional[float] = None) -> tuple[str, str]:
         """返回 (起始日期, 跳过状态)。跳过状态非空表示无需下载。
 
         前复权(qfq)历史数据会随新的分红除权重写，因此每次都需要整段重下；
         后复权(hfq)与不复权历史稳定，可以按「最后日期+1」增量追加。
+
+        例外（2026-10-27 事故）：本地已有 end 当日的 K 线、但它是盘中写入的
+        （文件 mtime 早于收盘截止且与 K 线同日）时，收盘后的更新必须重取当日
+        覆盖——merge_daily 按 (code, date) 去重保留新值，重取即修正收盘价；
+        否则当日真实收盘永远缺失，盘中价会被永久当作收盘价参与复权与信号。
         """
         if old is None or len(old) == 0:
             return self.start, ""
         last = pd.Timestamp(old["date"].max())
         nxt = (last + pd.Timedelta(days=1)).strftime("%Y%m%d")
         if nxt > end:
+            if (incremental_ok and not full
+                    and last.strftime("%Y%m%d") == end
+                    and _written_intraday(last, mtime)):
+                return end, ""   # 盘中写入的当日 bar：收盘后重取覆盖
             return self.start, "uptodate"
         if full or not incremental_ok:
             return self.start, ""
@@ -236,7 +285,9 @@ class Downloader:
     def _update_stock_one(self, code: str, name: str, end: str, full: bool) -> tuple[str, str, str]:
         path = store.daily_dir(self.data_dir, self.adjust) / f"{code}.parquet"
         old = store.load_daily(path)
-        start, skip = self._next_start(old, end, full, incremental_ok=self.adjust != "qfq")
+        start, skip = self._next_start(old, end, full,
+                                       incremental_ok=self.adjust != "qfq",
+                                       mtime=_safe_mtime(path))
         if skip:
             return code, skip, ""
         try:
@@ -278,6 +329,12 @@ class Downloader:
             if market and market != "all":
                 base = base[base["code"].str.endswith("." + market.upper())]
             targets = list(zip(base["code"].tolist(), base["name"].tolist()))
+            # 新股优先：尚无本地日线文件（新上市/历史缺失）的股票排到队列最前
+            # （稳定排序，已有文件的相对顺序不变）。全市场队列默认按代码排序，
+            # 新股代码段(300xxx/301xxx/688xxx)天然在队尾，EOD 中途卡死/重启补跑
+            # 时它们永远轮不到，上市数日后仍无 K 线（2026-10-27 事故伴生问题）。
+            ddir = store.daily_dir(self.data_dir, self.adjust)
+            targets.sort(key=lambda t: (ddir / f"{t[0]}.parquet").exists())
         if limit:
             targets = targets[: int(limit)]
         if not targets:
@@ -355,7 +412,8 @@ class Downloader:
             name = config.MAJOR_INDICES.get(code, "")
             path = store.index_dir(self.data_dir) / f"{code}.parquet"
             old = store.load_daily(path)
-            start, skip = self._next_start(old, end, full, incremental_ok=True)
+            start, skip = self._next_start(old, end, full, incremental_ok=True,
+                                           mtime=_safe_mtime(path))
             if skip:
                 stats[skip] += 1
                 _log(f"  {code} {name}: 已是最新")

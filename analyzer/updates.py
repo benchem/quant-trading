@@ -17,6 +17,8 @@
 - 单例锁：同一进程内同一时刻只允许一个更新任务（手动触发同理）；
 - 补跑：进程启动后若今天为交易日且已过触发时间而当日未跑过，则立即补跑一次；
 - 交易日历不可用时退化为工作日判断（planwatch/common.py 同款策略）；
+- 盘中每 30 分钟刷新股票列表（交易时段内）：新股上市当天即可搜索/加自选，
+  不必等 15:30 盘后更新（2026-10-27 事故：新股白天全站查不到）；
 - 各阶段独立容错：单阶段失败记入 errors 并继续后续阶段（自选股优先原则
   保证即便后续失败，自选数据也已刷新）；
 - 关键节点推送站内消息（进度 info、完成 ok、失败/触发信号 warn/alert）。
@@ -299,6 +301,11 @@ class EodUpdater:
         self.stall_timeout = float(stall_timeout)
         self._heartbeat = 0.0           # monotonic 时间戳，阶段推进/单股完成时打点
         self._stall_reported = False    # 一次运行只告警+重启一次
+        # 盘中股票列表定期刷新（分钟）：股票列表原本只在盘后 EOD 的 base 阶段
+        # 刷新——新股上市当天白天不存在于 stock_list，全站搜不到、加不了自选
+        # （2026-10-27 事故伴生问题）。交易时段内每 30 分钟刷一次。
+        self.list_refresh_interval: float = 1800.0
+        self._last_list_refresh = 0.0
         self._downloader_factory = downloader_factory
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -361,6 +368,7 @@ class EodUpdater:
                         and not self._is_running()):
                     self.trigger(source="schedule")
                 self._watchdog()
+                self._maybe_refresh_list(now)
                 # 触发时刻前的短暂睡眠（最多 check_interval，便于优雅退出）
                 delay = max(0.0, (fire - now).total_seconds())
                 self._stop.wait(min(delay, self.check_interval) if delay else self.check_interval)
@@ -369,6 +377,27 @@ class EodUpdater:
                 self._error(f"调度循环异常: {e}")
 
     # ------------------------------------------------------ 停滞看门狗
+
+    def _maybe_refresh_list(self, now: dt.datetime) -> None:
+        """交易时段内定期刷新股票列表（盘中新股当天可搜/可加自选）。
+
+        仅工作日 09:20-15:05（盘前集合竞价前 10 分钟到收盘截止）触发；
+        与 EOD 更新互斥（EOD 的 base 阶段自己会刷，避免同刻双请求）；
+        失败静默——下次周期重试，绝不影响调度主循环。
+        """
+        if self._is_running():
+            return
+        if now.weekday() >= 5 or not (dt.time(9, 20) <= now.time() <= dt.time(15, 5)):
+            return
+        if time.monotonic() - self._last_list_refresh < self.list_refresh_interval:
+            return
+        self._last_list_refresh = time.monotonic()
+        try:
+            dl = self._downloader()
+            dl.refresh_stock_list()
+            print(f"[eod] 盘中股票列表已刷新（{now.strftime('%H:%M')}）", flush=True)
+        except Exception as e:  # noqa: BLE001 静默降级：下个周期自动重试
+            print(f"[eod] 盘中股票列表刷新失败（稍后重试）: {e}", flush=True)
 
     def _beat(self) -> None:
         """心跳打点（阶段推进 / 单股完成）。"""

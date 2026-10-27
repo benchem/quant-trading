@@ -32,6 +32,7 @@ class HttpClient:
         self.verbose = verbose
         self.engine: Optional[str] = None
         self.limiter = RateLimiter(rate)
+        self.heartbeat = None  # 可选: 每次真实网络尝试前回调（EOD 看门狗心跳）
         self._engine_lock = threading.Lock()
 
     def set_rate(self, rate: float) -> None:
@@ -107,6 +108,11 @@ class HttpClient:
 
     def _fetch(self, engine: str, url: str, params: dict) -> bytes:
         self.limiter.wait()  # 统一限速：所有源、所有引擎、所有重试
+        if self.heartbeat is not None:
+            try:
+                self.heartbeat()  # 网络活跃心跳（EOD 看门狗用：区分「慢」与「死」）
+            except Exception:  # noqa: BLE001
+                pass
         return getattr(self, f"_engine_{engine}")(url, params)
 
     # ------------------------------------------------ 引擎探测与选择

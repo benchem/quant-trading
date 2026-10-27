@@ -459,6 +459,14 @@ class EodUpdater:
         self.last_run_day = day
         self._heartbeat = time.monotonic()
         self._stall_reported = False
+        try:  # 网络活跃心跳：每次真实 HTTP 尝试/baostock 池提交都打点。
+            # 解决 2026-10-26 晚误杀：主源 WAF 拦截时单请求重试可耗 10+ 分钟，
+            # 4 worker 全在途 -> 完成数型心跳 20 分钟无更新 -> 看门狗把「慢」判成「死」。
+            from downloader import source as _dl_source
+
+            _dl_source.set_heartbeat(self._beat)
+        except Exception:  # noqa: BLE001
+            pass
         self.notify.push(f"update:start:{day}",
                          f"盘后数据更新启动（{len(codes)} 只自选股优先刷新）",
                          level="info", desktop=False, source="system")
@@ -470,6 +478,12 @@ class EodUpdater:
             self.status["last_ok"] = self.status["finished"]
             errors = list(self.status["errors"])
             stats = dict(self.status.get("stats") or {})
+        try:  # 注销网络心跳（防泄漏：进程里后续 CLI 型调用不再触发 EOD 打点）
+            from downloader import source as _dl_source
+
+            _dl_source.set_heartbeat(None)
+        except Exception:  # noqa: BLE001
+            pass
         day = self.status.get("day") or ""
         if errors:
             self.notify.push(f"update:error:{day}",

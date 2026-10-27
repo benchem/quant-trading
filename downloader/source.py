@@ -253,6 +253,11 @@ def configure_http(rate: float | None = None, timeout: float | None = None) -> N
         _client.timeout = float(timeout)
 
 
+def set_heartbeat(fn) -> None:
+    """注册网络活跃心跳（每次真实 HTTP 尝试前回调；EOD 看门狗用）。"""
+    _client.heartbeat = fn
+
+
 # ============================================================ 通用工具
 def _d(s: str) -> dt.date:
     return dt.date(int(s[:4]), int(s[4:6]), int(s[6:8]))
@@ -768,6 +773,11 @@ def _bs_query_via_pool(code: str, start: str, end: str, flag: str):
     pool = _bs_pool_get()
     if pool is None:
         return None
+    if _client.heartbeat is not None:
+        try:
+            _client.heartbeat()  # 提交即视为网络活跃（子进程活动父进程观测不到）
+        except Exception:  # noqa: BLE001
+            pass
     try:
         fut = pool.submit(_bs_pool_worker, code, start, end, flag)
         return fut.result(timeout=_BS_POOL_QUERY_TIMEOUT)

@@ -141,7 +141,8 @@ def _safe_static(path: str):
 
 
 def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, updater=None,
-                 auth: AuthManager | None = None, brief_pusher=None):
+                 auth: AuthManager | None = None, brief_pusher=None,
+                 brief_generator=None):
     """runner: stock_analysis.core.runner.Runner（插件分析）；None 时禁用 /api/plugins*。
     syncer: analyzer.minute.MinuteSyncer（自选股分钟线后台同步）；None 时禁用。
     notifier: 消息中心——多用户模式传 NotificationHub（按用户隔离收件箱），
@@ -149,6 +150,8 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
     updater: analyzer.updates.EodUpdater（盘后自动更新调度器）；None 时禁用 /api/update/*。
     brief_pusher: analyzer.overseas_push.OverseasBriefPusher（美股简报邮件推送）；
         None 时禁用 /api/us_brief_push。
+    brief_generator: analyzer.agent.brief.USBriefGenerator（美股简报自动生成）；
+        None 时禁用 /api/us_brief_gen。
     auth: AuthManager；None 为「共享」单用户模式（免登录，数据存根级文件），
         否则所有业务 API 需登录（自选/交易/站内信按用户隔离）。"""
     hub = isinstance(notifier, NotificationHub)
@@ -1144,6 +1147,14 @@ def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765,
 
     _watch_data_changes(store, runner)
 
+    # 美股简报自动生成（"昨夜美股"的写信环节，与下方推送的寄信环节互补）：
+    # 每工作日 08:00 CST 东财快照/快讯 → LLM → 校验落盘 data/news/us_market/当日.md，
+    # 交给下方 08:40 的推送线程发邮件；未配置 AI_API_KEY 时自动停用，不影响其余功能。
+    from .agent.brief import generator_from_env
+
+    brief_generator = generator_from_env(data_dir, notifier=notifier)
+    brief_generator.start()
+
     # 昨夜美股简报邮件推送（借 iam 服务器 trending 项目的 email 渠道做法）：
     # 每工作日 08:40 CST 把 data/news/us_market/当日.md 渲染成 HTML 邮件推送；
     # 未配置 SMTP_USER/SMTP_PASS/MAIL_TO 时自动停用，不影响其余功能。
@@ -1154,7 +1165,7 @@ def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765,
 
     httpd = ThreadingHTTPServer((host, port), make_handler(
         store, runner=runner, syncer=syncer, notifier=notifier, updater=updater,
-        auth=auth, brief_pusher=brief_pusher))
+        auth=auth, brief_pusher=brief_pusher, brief_generator=brief_generator))
     url = f"http://{host}:{port}/"
     print(f"数据加载完成: {store.meta['n_stocks']} 只股票 | "
           f"{store.meta['date_min']} ~ {store.meta['date_max']} | "

@@ -14,9 +14,12 @@
     context.py  上下文组装策略：聚合哪些数据、超限如何裁剪（改"喂什么"改这里）
     analysis.py 个股综合分析入口与报告缓存
     review.py   LLM 版每日复盘
+    brief.py    每日美股简报自动生成（数据采集 + LLM + 校验落盘 + 调度）
 """
 from .llm import AIConfig, AIError, chat_completion, DISCLAIMER  # noqa: F401
-from .prompts import PROMPT_VERSION, REVIEW_PROMPT_VERSION  # noqa: F401
+from .prompts import (PROMPT_VERSION, REVIEW_PROMPT_VERSION,  # noqa: F401
+                      BRIEF_PROMPT_VERSION)
 from .context import collect_context, build_prompt, DEFAULT_PLUGINS  # noqa: F401
 from .analysis import generate  # noqa: F401
 from .review import build_llm_review  # noqa: F401
+from .brief import USBriefGenerator, generate_brief, BriefGenError  # noqa: F401

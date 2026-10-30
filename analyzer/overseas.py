@@ -86,15 +86,18 @@ def _mapping_for(lines: list[str], code: str | None) -> list[str]:
 
 
 def load_daily_brief(data_dir: str | Path, code: str | None,
-                     on_date: date | None = None) -> dict:
+                     on_date: date | None = None,
+                     _filename: str | None = None) -> dict:
     """读取当天简报；任何校验失败均不返回旧简报中的信号内容。
 
     code=None 时不做个股映射过滤（整体推送视角）。
+    _filename 供生成端校验草稿用（默认按日期命名，推送/AI 分析勿传）。
     """
     day = on_date or datetime.now(LOCAL_TZ).date()
     if day.weekday() >= 5:
         return _unavailable(day, "周末")
-    path = Path(data_dir) / "news" / "us_market" / f"{day.isoformat()}.md"
+    fname = _filename or f"{day.isoformat()}.md"
+    path = Path(data_dir) / "news" / "us_market" / fname
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:

@@ -13,6 +13,7 @@
     prompts.py  全部 prompt 文本与版本号（改措辞/输出结构只改这里，递增版本使缓存失效）
     context.py  上下文组装策略：聚合哪些数据、超限如何裁剪（改"喂什么"改这里）
     analysis.py 个股综合分析入口与报告缓存
+    jobs.py     个股综合分析的异步任务调度（POST /api/ai_analysis 的调度/接口层）
     review.py   LLM 版每日复盘
     brief.py    每日美股简报自动生成（数据采集 + LLM + 校验落盘 + 调度）
 """
@@ -21,5 +22,6 @@ from .prompts import (PROMPT_VERSION, REVIEW_PROMPT_VERSION,  # noqa: F401
                       BRIEF_PROMPT_VERSION)
 from .context import collect_context, build_prompt, DEFAULT_PLUGINS  # noqa: F401
 from .analysis import generate  # noqa: F401
+from .jobs import AIJobManager  # noqa: F401
 from .review import build_llm_review  # noqa: F401
 from .brief import USBriefGenerator, generate_brief, BriefGenError  # noqa: F401

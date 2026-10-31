@@ -417,6 +417,14 @@ python -m analyzer serve
 - 只在点击按钮时调用大模型（切股票不自动调用）；报告缓存到 `data/ai/{code}.json`，
   TTL 6 小时，且以「prompt 版本 + 模型名 + 上下文指纹（含数据截止日期）」为键，
   模型数据或新闻变化即自动失效；「重新生成」强制忽略缓存。
+- **异步任务模式**（生成实测约 3~8 分钟，不占住 HTTP 请求）：缓存命中时
+  `POST /api/ai_analysis` 同步秒回报告（`cached: true`）；未命中立即返回
+  `202 {"job_id", "queued": true, "status", "poll_ms"}`，后台线程执行生成——
+  全局 LLM 并发上限 2（共享网关同时供美股简报/LLM 复盘使用，防限流），
+  超出排队（排队上限 16）；同一股票在途任务去重，重复提交返回已有任务。
+  任务状态存内存（服务重启丢任务，重新提交即可；报告本体在磁盘缓存中，
+  指纹未变重提交会直接命中秒回）。前端轮询展示进度，等待期间可切换股票，
+  报告生成后切回即可查看（页面刷新后进入该股也会自动恢复展示）。
 - 单个模型或新闻不可用只降级为报告内的数据警告，不阻塞生成。
 - 海外信号读取 `data/news/us_market/YYYY-MM-DD.md`，只接受北京时间当天、明确标记
   `状态：有效` 且含合法风险偏好分数和核心要闻的简报；周末、休市、获取失败、日期不符或
@@ -424,7 +432,11 @@ python -m analyzer serve
 - 隐私/费用：上送第三方服务的是模型指标、行情快照、新闻标题与海外简报提取内容（不含交易流水等账户数据），
   调用会产生对应服务商的 token 费用。
 - AI 报告仅供研究参考，不构成任何投资建议。
-- API：`POST /api/ai_analysis`，body `{"code": "600519.SH", "refresh": false}`。
+- API：`POST /api/ai_analysis`，body `{"code": "600519.SH", "refresh": false}`
+  （缓存命中 200 返回报告，否则 202 返回任务信息）；
+  `GET /api/ai_analysis/status?code=600519.SH`（或 `?job_id=…`）查询任务：
+  `queued` / `running` / `done`（附完整报告 payload）/ `failed`（附 `error`
+  与 `error_status`）；该股无任务时返回 `{"status": "none"}`。
 
 ### 盘后自动更新与消息提醒
 

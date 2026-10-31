@@ -16,8 +16,10 @@ const state = {
   marketDays: 365,     // 市场页区间（图表与排行榜共用）
   stockCode: null,
   stockData: null,
-  ai: null,            // 当前个股的 AI 分析报告（切换股票即清空）
-  aiLoading: false,
+  ai: null,            // 当前个股的 AI 分析报告（正在展示的）
+  aiByCode: {},        // code -> 报告 payload（前端缓存：轮询完成/切股后不丢，切回直显）
+  aiLoading: false,    // （已废弃，保留字段防旧引用）改用 aiPolling 按 code 跟踪
+  aiPolling: {},       // code -> job_id（该股生成任务轮询中；"submitting" = POST 在途）
   stockDays: 365,
   rankView: "stock",   // 排行榜视图: stock 个股 | board 板块
   rankBoard: "",       // 板块筛选（board_code，"" = 全部；行业/概念均可）
@@ -101,6 +103,8 @@ function toast(msg) {
   clearTimeout(el._t);
   el._t = setTimeout(() => el.classList.remove("show"), 2600);
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function fmtPct(x, d = 2) {
   if (x == null || !isFinite(x)) return "—";
@@ -915,7 +919,7 @@ async function pickStock(code, opts = {}) {
     loadFund();
     loadFlow();          // 资金流子标签（内含公告表加载）
     loadAnnounce();
-    resetAIPanel();      // AI 报告不自动生成，仅清空上一只股票的内容
+    resetAIPanel();      // AI 面板重置：本会话已生成的报告直接展示，后端在途任务恢复轮询
     if (opts.history) recordStockHistory(code, d.name);
     return true;
   } catch (err) { toast(err.message); return false; }
@@ -3059,11 +3063,11 @@ async function loadFund() {
 
 /* ============================== 个股分析·AI 综合分析 ============================== */
 
-const AI_HINT_DEFAULT = "点击「生成 AI 分析」调用云端大模型（约需数十秒）；报告缓存 6 小时，模型数据或新闻变化后自动重新生成";
+const AI_HINT_DEFAULT = "点击「生成 AI 分析」调用云端大模型（推理约需 3~8 分钟，生成期间可切换股票稍后回来查看）；报告缓存 6 小时，模型数据或新闻变化后自动重新生成";
 
 function resetAIPanel() {
+  const code = state.stockCode;
   state.ai = null;
-  state.aiLoading = false;
   $("#ai-report").innerHTML = "";
   $("#ai-meta").textContent = "";
   $("#ai-context").textContent = "";
@@ -3071,6 +3075,12 @@ function resetAIPanel() {
   $("#ai-hint").textContent = AI_HINT_DEFAULT;
   $("#ai-generate").style.display = "";
   $("#ai-refresh").style.display = "none";
+  setAIButtons(false);   // 修复：上一只股票生成中切走时，按钮残留禁用导致新股票无法生成
+  // 前端已有该股报告（本次会话内生成过）：直接展示，不重新请求
+  const cached = state.aiByCode[code];
+  if (cached) { renderAIFor(code, cached); return; }
+  // 后端可能有该股的在途/已完成任务（如刷新页面后）：查询恢复
+  if (code) syncAIFromServer(code);
 }
 
 // 轻量 Markdown 渲染：先整体 HTML 转义，再处理标题/加粗/行内代码/列表/分隔线（防 XSS）
@@ -3129,29 +3139,121 @@ function renderAI(d) {
   $("#ai-context").innerHTML = escHtml(parts.join(" · ")) + (warns ? `<br>数据警告：${warns}` : "");
 }
 
+/* ---------- 异步任务轮询（POST /api/ai_analysis -> GET /api/ai_analysis/status） ---------- */
+
+const AI_POLL_MS = 3000;        // 轮询间隔（与后端下发的 poll_ms 一致）
+const AI_POLL_MAX_FAILS = 5;    // 状态查询连续失败上限（约 15s），超过则放弃轮询
+
+/** 生成/重新生成按钮的禁用态（属于当前展示的股票；切股时由 resetAIPanel 重置）。 */
+function setAIButtons(disabled) {
+  $("#ai-generate").disabled = disabled;
+  $("#ai-refresh").disabled = disabled;
+}
+
+/** 渲染某股报告：仅当用户仍停在该股（切走了就只留 state.aiByCode 缓存，切回时展示）。 */
+function renderAIFor(code, d) {
+  if (state.stockCode !== code) return;
+  state.ai = d;
+  renderAI(d);
+}
+
 async function loadAI(refresh) {
-  if (!state.stockCode || state.aiLoading) return;
   const code = state.stockCode;
-  state.aiLoading = true;
-  $("#ai-generate").disabled = true;
-  $("#ai-refresh").disabled = true;
+  if (!code || state.aiPolling[code]) return;   // 该股已有在途请求/任务，不重复提交
+  state.aiPolling[code] = "submitting";         // POST 返回前先占位防连点
+  setAIButtons(true);
   $("#ai-status").textContent = "";
-  $("#ai-hint").textContent = refresh ? "正在重新生成，忽略本地缓存…" : "大模型生成中，约需数十秒，请耐心等待…";
+  $("#ai-hint").textContent = refresh ? "正在重新生成（忽略本地缓存）…" : "正在提交 AI 分析请求…";
   try {
     const d = await apiPost("/api/ai_analysis", { code, refresh: !!refresh });
-    if (state.stockCode !== code) return;   // 等待期间已切换股票，丢弃旧结果
-    state.ai = d;
-    renderAI(d);
+    if (d && d.job_id) {
+      // 异步任务：轮询直至完成（等待期间可切换股票，结果不丢）
+      state.aiPolling[code] = d.job_id;
+      pollAIJob(code, d.job_id);
+    } else {
+      // 缓存命中：同步返回完整报告（后端秒回路径）
+      delete state.aiPolling[code];
+      state.aiByCode[code] = d;
+      if (state.stockCode === code) setAIButtons(false);   // 已切走则不动新股票的按钮态
+      renderAIFor(code, d);
+    }
   } catch (err) {
-    if (state.stockCode !== code) return;
-    $("#ai-hint").textContent = "AI 分析不可用: " + err.message;
+    delete state.aiPolling[code];
+    if (state.stockCode === code) {
+      setAIButtons(false);
+      $("#ai-hint").textContent = "AI 分析不可用: " + err.message;
+    }
     toast(err.message);
-  } finally {
-    if (state.stockCode !== code) return;  // 不解除新股票请求的 loading 状态
-    state.aiLoading = false;
-    $("#ai-generate").disabled = false;
-    $("#ai-refresh").disabled = false;
   }
+}
+
+/** 轮询任务直至 done/failed。等待期间切走不丢结果：完成后写入前端缓存并按需渲染。 */
+async function pollAIJob(code, jobId) {
+  const startedAt = Date.now();
+  let fails = 0;
+  while (state.aiPolling[code] === jobId) {
+    await sleep(AI_POLL_MS);
+    if (state.aiPolling[code] !== jobId) return;   // 已被中止/覆盖
+    let st = null;
+    try {
+      st = await api(`/api/ai_analysis/status?job_id=${encodeURIComponent(jobId)}`);
+      fails = 0;
+    } catch (err) {
+      if (++fails >= AI_POLL_MAX_FAILS) {
+        delete state.aiPolling[code];
+        if (state.stockCode === code) {
+          setAIButtons(false);
+          $("#ai-hint").textContent = "AI 分析状态查询失败: " + err.message + "（可重新生成）";
+        }
+        return;
+      }
+      continue;   // 瞬时网络抖动：下一轮继续
+    }
+    if (st.status === "done" && st.report) {
+      delete state.aiPolling[code];
+      state.aiByCode[code] = st.report;
+      if (state.stockCode === code) setAIButtons(false);
+      else toast(`${code} 的 AI 分析已生成，切回即可查看`);
+      renderAIFor(code, st.report);
+      return;
+    }
+    if (st.status === "failed") {
+      delete state.aiPolling[code];
+      if (state.stockCode === code) {
+        setAIButtons(false);
+        $("#ai-hint").textContent = "AI 分析生成失败: " + (st.error || "未知错误") + "（可重新生成）";
+      }
+      return;
+    }
+    // queued / running：更新等待时长提示（仅当前股）
+    if (state.stockCode === code) {
+      const sec = Math.floor((Date.now() - startedAt) / 1000);
+      const label = st.status === "queued" ? "排队中" : "大模型推理中";
+      $("#ai-hint").textContent =
+        `AI 分析生成中（${label}，约需 3~8 分钟，可切换股票稍后回来查看）· 已等待 ${Math.floor(sec / 60)} 分 ${sec % 60} 秒`;
+    }
+  }
+}
+
+/** 进入某股时向后端对账：任务在途则恢复轮询、已完成则直接展示（页面刷新场景）。 */
+async function syncAIFromServer(code) {
+  try {
+    const st = await api(`/api/ai_analysis/status?code=${encodeURIComponent(code)}`);
+    if (state.stockCode !== code || !st) return;   // 查询期间又切走了
+    if (st.status === "done" && st.report) {
+      state.aiByCode[code] = st.report;
+      renderAIFor(code, st.report);
+    } else if (st.status === "failed") {
+      $("#ai-hint").textContent = "上次 AI 分析生成失败: " + (st.error || "未知错误") + "（可重新生成）";
+    } else if (st.status === "queued" || st.status === "running") {
+      setAIButtons(true);
+      if (!state.aiPolling[code]) {   // 本地无轮询（如刷新页面后）才拉起，避免重复轮询
+        state.aiPolling[code] = st.job_id;
+        pollAIJob(code, st.job_id);
+      }
+    }
+    // status === "none"：保持默认提示；用户点击按钮时 POST 会命中缓存或新建任务
+  } catch (_) { /* 对账失败静默：面板保持默认提示 */ }
 }
 
 /* ============================== 排行榜 ============================== */

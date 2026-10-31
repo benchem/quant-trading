@@ -142,7 +142,7 @@ def _safe_static(path: str):
 
 def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, updater=None,
                  auth: AuthManager | None = None, brief_pusher=None,
-                 brief_generator=None):
+                 brief_generator=None, ai_jobs=None):
     """runner: stock_analysis.core.runner.Runner（插件分析）；None 时禁用 /api/plugins*。
     syncer: analyzer.minute.MinuteSyncer（自选股分钟线后台同步）；None 时禁用。
     notifier: 消息中心——多用户模式传 NotificationHub（按用户隔离收件箱），
@@ -152,6 +152,8 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
         None 时禁用 /api/us_brief_push。
     brief_generator: analyzer.agent.brief.USBriefGenerator（美股简报自动生成）；
         None 时禁用 /api/us_brief_gen。
+    ai_jobs: analyzer.agent.jobs.AIJobManager（个股 AI 分析异步任务调度）；
+        None 时禁用 /api/ai_analysis*。
     auth: AuthManager；None 为「共享」单用户模式（免登录，数据存根级文件），
         否则所有业务 API 需登录（自选/交易/站内信按用户隔离）。"""
     hub = isinstance(notifier, NotificationHub)
@@ -578,6 +580,20 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                     }
                     result = runner.run(plugin, code, **pparams)
                     self._json(result.to_dict())
+                elif path == "/api/ai_analysis/status":
+                    if ai_jobs is None:
+                        return self._json({"error": "AI 分析任务调度未启用"}, 503)
+                    code = (params.get("code") or "").upper()
+                    job_id = params.get("job_id") or ""
+                    if not code and not job_id:
+                        return self._json({"error": "需要 code 或 job_id 参数"}, 400)
+                    if code and not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
+                        return self._json({"error": "code 格式应为 600519.SH"}, 400)
+                    out = ai_jobs.status(code=code or None, job_id=job_id or None)
+                    if out is None:
+                        return self._json({"error": "未找到该任务（可能已被清理，"
+                                                    "请重新提交）"}, 404)
+                    self._json(out)
                 elif path == "/api/update/status":
                     if updater is None:
                         return self._json({"error": "盘后自动更新未启用"}, 503)
@@ -713,9 +729,15 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                         "pending": syncer.pending()})
 
         def _post_ai_analysis(self):
-            """个股 AI 综合分析：聚合插件结果 -> 云端大模型，报告缓存 data/ai/。"""
+            """个股 AI 综合分析：缓存命中同步秒回；未命中入异步任务（202）。
+
+            进度与结果经 GET /api/ai_analysis/status 查询（?code= 或 ?job_id=）；
+            同 code 在途任务去重、全局 LLM 并发上限等策略见 analyzer/agent/jobs.py。
+            """
             if runner is None:
                 return self._json({"error": "插件分析未启用，无法生成 AI 分析"}, 503)
+            if ai_jobs is None:
+                return self._json({"error": "AI 分析任务调度未启用"}, 503)
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b"{}"
@@ -725,20 +747,17 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
             code = (req.get("code") or "").upper()
             if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code):
                 return self._json({"error": "code 格式应为 600519.SH"}, 400)
-            from .agent import AIConfig, AIError, generate
+            from .agent import AIError
 
-            config = AIConfig.from_env()
-            if not config.enabled:
-                return self._json({"error": "AI 分析未配置：请在服务端设置环境变量 "
-                                            "AI_API_KEY（可选 AI_BASE_URL / AI_MODEL）后重启 analyzer"}, 503)
             try:
-                self._json(generate(store, runner, code,
-                                    refresh=bool(req.get("refresh")), config=config))
+                out = ai_jobs.submit(code, refresh=bool(req.get("refresh")))
             except AIError as e:
                 return self._json({"error": str(e)}, e.status)
             except Exception:
                 traceback.print_exc()
-                self._json({"error": "AI 分析生成失败"}, 500)
+                return self._json({"error": "AI 分析提交失败"}, 500)
+            # 缓存命中：out 为完整报告 payload -> 保持同步 200；否则为 job 信息 -> 202
+            self._json(out, 200 if out.get("report") is not None else 202)
 
         def _post_watchlist(self, user: str | None):
             try:
@@ -1056,12 +1075,18 @@ def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765,
         print(f"警告: 插件分析不可用（{e}），/api/plugins* 将返回 503")
 
     from .agent import AIConfig
+    from .agent.jobs import AIJobManager
 
     ai_cfg = AIConfig.from_env()
     if ai_cfg.enabled:
-        print(f"AI 分析: 已启用（模型 {ai_cfg.model} · {ai_cfg.base_url}）")
+        print(f"AI 分析: 已启用（模型 {ai_cfg.model} · {ai_cfg.base_url}；"
+              "异步任务模式：POST /api/ai_analysis 提交，"
+              "GET /api/ai_analysis/status 轮询，LLM 并发上限 2）")
     else:
         print("AI 分析: 未启用（设置环境变量 AI_API_KEY 后可用，可选 AI_BASE_URL/AI_MODEL）")
+
+    # 个股 AI 分析异步任务调度器（缓存命中同步秒回，未命中后台生成 + 轮询）
+    ai_jobs = AIJobManager(store, runner)
 
     # 消息中心 + 盘后自动更新：每交易日 15:30（CST）触发全量更新，
     # 自选股数据优先刷新，更新完成后扫描自选股模型信号并推送提醒。
@@ -1165,7 +1190,8 @@ def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765,
 
     httpd = ThreadingHTTPServer((host, port), make_handler(
         store, runner=runner, syncer=syncer, notifier=notifier, updater=updater,
-        auth=auth, brief_pusher=brief_pusher, brief_generator=brief_generator))
+        auth=auth, brief_pusher=brief_pusher, brief_generator=brief_generator,
+        ai_jobs=ai_jobs))
     url = f"http://{host}:{port}/"
     print(f"数据加载完成: {store.meta['n_stocks']} 只股票 | "
           f"{store.meta['date_min']} ~ {store.meta['date_max']} | "

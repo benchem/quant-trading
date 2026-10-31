@@ -578,7 +578,8 @@ class EodUpdater:
                 self._error(f"自选股日线更新失败: {e}")
 
         # 3. 自选股资讯刷新（新闻/估值/财报/资金流/公告/情绪，强制绕过缓存
-        #    TTL；失败静默降级——资讯类失败不影响主链路）
+        #    TTL；失败不中断主链路，但必须记入 status.errors——旧实现裸 except
+        #    pass 让故障完全无痕，资金流可无限期陈旧）
         self._stage("watchlist_info")
         for c in codes:
             for fn in (self._refresh_news, self._refresh_valuation,
@@ -586,8 +587,8 @@ class EodUpdater:
                        self._refresh_announce, self._refresh_sentiment):
                 try:
                     fn(c)
-                except Exception:  # noqa: BLE001 资讯失败不影响主链路
-                    pass
+                except Exception as e:  # noqa: BLE001 资讯失败不影响主链路
+                    self._error(f"自选资讯刷新失败 ({c} {fn.__name__}): {str(e)[:120]}")
                 self._beat()  # 单股多源刷新可能很慢，逐项打点防看门狗误报
 
         # 4. 全市场日线（自选股刚更新过，增量判定为「已是最新」自动跳过，无需排除）
@@ -597,6 +598,13 @@ class EodUpdater:
             self._merge_stats(stats)
         except Exception as e:  # noqa: BLE001
             self._error(f"全市场日线更新失败: {e}")
+
+        # 4b. 单位断裂待修清单自动重试（全量重拉；清单为空时 no-op，不触网）
+        if hasattr(dl, "repair_stocks"):
+            try:
+                self._merge_stats(dl.repair_stocks() or {})
+            except Exception as e:  # noqa: BLE001
+                self._error(f"单位断裂修复失败: {e}")
 
         # 5. 指数
         self._stage("index")
@@ -697,7 +705,9 @@ class EodUpdater:
     def _refresh_flow(self, code: str) -> None:
         from .flow import fetch
 
-        fetch(code, self.store.root, refresh=True)
+        # strict=True: EOD 刷新必须让失败可见（status.errors），不得静默回退旧缓存
+        # 假装成功（2026-10-30 根因S4：资金流可无限期陈旧且无痕）。
+        fetch(code, self.store.root, refresh=True, strict=True)
 
     def _refresh_announce(self, code: str) -> None:
         from .announce import fetch

@@ -334,9 +334,12 @@ def _em_index_daily(wind_code: str, start: str, end: str) -> pd.DataFrame:
         if klines:
             _EM_INDEX_MARKET[num] = m
             return _em_klines_to_df(klines, wind_code)
+    # 2026-10-30 事故: 旧实现在此返回空 df 假装成功，with_fallback 不降级，
+    # 000688.SH 指数「已是最新」判定错误、连续多日停在旧数据。必须报错，
+    # 让 em->tx->bs 降级链生效（腾讯/东财对同一指数至少一家有数据）。
     if last_err is not None:
         raise last_err
-    return pd.DataFrame(columns=OHLCV_COLUMNS)
+    raise FetchError(f"东财指数所有市场前缀均无数据 (wind_code={wind_code}, {start}~{end})")
 
 
 _EM_INDEX_MARKET: dict[str, str] = {}  # 指数 secid 市场前缀缓存
@@ -350,20 +353,30 @@ def _em_stock_list() -> pd.DataFrame:
             "ut": _EM_UT_CLIST, "fltt": "2", "invt": "2", "fid": "f12",
             "fs": _EM_FS, "fields": _EM_LIST_FIELDS,
         }
-        data = _client.get_json(_EM_CLIST_URL, params)
-        d = data.get("data") or {}
-        if not d:
-            raise FetchError("东财列表返回空")
-        total = d.get("total") or 0
-        chunk = d.get("diff") or []
+        chunk = None
+        for _attempt in range(2):  # 空页多为服务端瞬断，重试同一页一次
+            d = _client.get_json(_EM_CLIST_URL, params).get("data") or {}
+            if not d:
+                raise FetchError("东财列表返回空")
+            total = d.get("total") or 0
+            chunk = d.get("diff") or []
+            if chunk:
+                break
+        # 2026-10-26 事故: 旧实现在空页处静默 break，落盘截断列表
+        # （4605 行，整段缺失 688 科创板/北交所），617 只股票连续 5 天
+        # 不在 EOD 目标列表里、日线停在 10-23。空页=分页不完整，必须报错
+        # 让 with_fallback 换源，由上层完整性守卫兜底。
         if not chunk:
-            break
+            raise FetchError(
+                f"东财列表第 {page} 页为空（total={total}, 已取 {len(items)}），分页不完整")
         field_names = _EM_LIST_FIELDS.split(",")
         for it in chunk:
             items.append(it if isinstance(it, dict) else dict(zip(field_names, it)))
         if len(items) >= total or page > 200:
             break
         page += 1
+    if total and len(items) < total:
+        raise FetchError(f"东财列表分页不完整: 已取 {len(items)}/{total}")
     rows = []
     for it in items:
         rec = {_EM_LIST_MAP[k]: v for k, v in it.items() if k in _EM_LIST_MAP}

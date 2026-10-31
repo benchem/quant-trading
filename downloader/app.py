@@ -12,6 +12,7 @@ import pandas as pd
 
 from . import config, source, store
 from .codes import to_wind_code
+from .errors import FetchError
 from .ratelimit import with_retry
 
 try:
@@ -124,7 +125,74 @@ _STAT_LABEL = {
     "nodata": "区间无数据",
     "skipped": "疑似单位异常已跳过",
     "failed": "失败",
+    "stale": "源缺数据待重试",
+    "repaired": "单位断裂已修复",
 }
+
+#: 交易日历缓存 {(data_dir, mtime): Series|None}：空窗交叉核对会大量调用，
+#: 按文件 mtime 缓存避免每只股票重读 parquet。
+_CAL_CACHE: dict[tuple, Optional[pd.Series]] = {}
+
+
+def _load_trade_calendar(data_dir) -> Optional[pd.Series]:
+    """读交易日历（缓存；文件缺失/损坏返回 None，调用方保守处理）。"""
+    p = store.trade_cal_path(data_dir)
+    key = (str(p), _safe_mtime(p))
+    if key in _CAL_CACHE:
+        return _CAL_CACHE[key]
+    days: Optional[pd.Series] = None
+    try:
+        cal = pd.read_parquet(p, engine="pyarrow")
+        col = "trade_date" if "trade_date" in cal.columns else cal.columns[0]
+        s = pd.Series(pd.to_datetime(cal[col])).dropna()
+        days = s if len(s) else None
+    except Exception:  # noqa: BLE001
+        days = None
+    if len(_CAL_CACHE) > 16:
+        _CAL_CACHE.clear()
+    _CAL_CACHE[key] = days
+    return days
+
+
+#: 股票列表首次落盘（无旧列表可比）时的最小行数：A股总数远超此值，
+#: 低于它几乎必然是分页截断等异常，拒绝写盘。
+MIN_STOCK_LIST_SIZE = 3000
+
+
+def _stock_list_family(df: pd.DataFrame) -> dict[str, int]:
+    """3 位代码前缀 -> 家数（600/601/300/688/002/430… 各成一族）。"""
+    return df["code"].astype(str).str[:3].value_counts().to_dict()
+
+
+def _stock_list_guard(new: pd.DataFrame, old: Optional[pd.DataFrame]) -> str:
+    """股票列表写盘前守卫：拒绝明显异常的列表，保留旧列表。
+
+    2026-10-26 事故: clist 分页中途空页静默截断，4605 行列表落盘（688/689/BJ
+    整段缺失），此后所有全市场运行照坏列表跑，科创板股票数日无更新。判定：
+    - 无旧列表（首次写入）: 总量 < MIN_STOCK_LIST_SIZE -> 拒绝；
+    - 有旧列表: 任一 3 位前缀家族整体消失 / 单家族缩水 >50% / 总量缩水 >30%
+      -> 拒绝。新增家族与扩容放行（正常现象）。
+    返回非空拒绝原因；空串放行。
+    """
+    n_new = len(new)
+    if old is None or len(old) == 0:
+        if n_new < MIN_STOCK_LIST_SIZE:
+            return f"列表总量 {n_new} 异常偏小 (<{MIN_STOCK_LIST_SIZE})"
+        return ""
+    new_fam = _stock_list_family(new)
+    old_fam = _stock_list_family(old)
+    gone = sorted(f for f in old_fam if f not in new_fam)
+    if gone:
+        n_gone = sum(old_fam[f] for f in gone)
+        return f"代码前缀家族 {gone}（共 {n_gone} 只）整体消失"
+    shrunk = sorted(f for f, c in old_fam.items()
+                    if f in new_fam and new_fam[f] < c * 0.5)
+    if shrunk:
+        detail = ", ".join(f"{f}:{old_fam[f]}->{new_fam[f]}" for f in shrunk)
+        return f"代码前缀家族缩水超 50%: {detail}"
+    if n_new < len(old) * 0.7:
+        return f"列表总量由 {len(old)} 缩水至 {n_new}（降幅超 30%）"
+    return ""
 
 
 class Downloader:
@@ -145,7 +213,19 @@ class Downloader:
     # ------------------------------------------------ 股票列表 / 交易日历
     def refresh_stock_list(self) -> pd.DataFrame:
         df = with_retry(source.fetch_stock_list, desc="股票列表")
-        store.save_parquet(store.stock_list_path(self.data_dir), df)
+        # 写盘前守卫（2026-10-26 事故: 截断列表落盘后被当全市场跑）:
+        # 明显异常时拒绝写盘并 raise，本地旧列表原样保留，重跑同一命令重试。
+        p = store.stock_list_path(self.data_dir)
+        old: Optional[pd.DataFrame] = None
+        if p.exists():
+            try:
+                old = pd.read_parquet(p, engine="pyarrow")
+            except Exception:  # noqa: BLE001 旧列表损坏按无旧列表处理
+                old = None
+        reason = _stock_list_guard(df, old)
+        if reason:
+            raise FetchError(f"股票列表完整性校验未通过，保留旧列表: {reason}")
+        store.save_parquet(p, df)
         # dataset/stock_basic 归档副本同步刷新：原实现只在 build_dataset（EOD
         # 第 7 阶段）里复制，而 EOD 全链路经常在"全市场日线"阶段卡死重启，
         # 副本一滞后就是好几天，依赖它的路径看不到新上市股票（2026-10-27）。
@@ -256,6 +336,194 @@ class Downloader:
         return s.max()
 
     # ------------------------------------------------ A股日线
+    def _window_has_trading_day(self, start: str, end: str) -> Optional[bool]:
+        """窗口 [start, end] 是否含交易日（按本地交易日历）。
+
+        日历覆盖范围内查日历；超出日历最大值（日历滞后/未来日期）退化工作日
+        判断（与 analyzer.updates._is_trading_day 降级策略一致）——2026-10-30
+        事故中日历止于 10-29，10-30 窗口的「是否有交易日」判定不能因日历过期
+        而丢失；日历不可用返回 None（调用方保守处理）。
+        """
+        days = _load_trade_calendar(self.data_dir)
+        if days is None:
+            return None
+        s, e = pd.Timestamp(start), pd.Timestamp(end)
+        if e <= days.max():
+            return bool(((days >= s) & (days <= e)).any())
+        d, last_d = s.date(), e.date()
+        while d <= last_d:
+            if d.weekday() < 5:
+                return True
+            d += dt.timedelta(days=1)
+        return False
+
+    def _judge_no_progress(self, code: str, old, last: Optional[pd.Timestamp],
+                           start: str, end: str) -> tuple[str, str, str]:
+        """窗口未返回新数据（空/全部早于窗口起点）：区分「停牌」与「源缺数据」。
+
+        2026-10-30 根因A/B: 旧实现空窗口+有旧数据无条件标「已是最新」，550 只
+        实际有成交的股票被误判最新、393 只被旧 bar 覆盖写入。判定依据（明确）：
+        - 窗口无交易日（日历判定）-> 无数据正常 -> uptodate；
+        - 否则用 adjust=none（不复权）同窗口交叉核对：
+          none 有 bar -> 有交易活动、复权源缺数据 -> stale（入失败清单，
+          运行内二次重试 + 次日重跑重试）；
+          none 也空 -> 停牌 -> uptodate；
+          交叉核对自身失败 -> fail-safe 按源缺口（stale，宁误报不漏报）。
+        """
+        if old is None or len(old) == 0 or last is None:
+            return code, "nodata", "区间无数据（无本地历史）"
+        if self._window_has_trading_day(start, end) is False:
+            return code, "uptodate", ""
+        if self._window_has_bars(code, start, end):
+            return code, "stale", (
+                f"{self.adjust} 窗口 {start}~{end} 无新数据但复权交叉核对(不复权)"
+                f"有数据（疑似数据源缺口，将重试）")
+        return code, "uptodate", ""
+
+    def _window_has_bars(self, code: str, start: str, end: str) -> bool:
+        """不复权同窗口交叉核对：窗口内是否有 bar（=有交易活动）。"""
+        try:
+            df = with_retry(
+                source.fetch_daily,
+                kwargs=dict(wind_code=code, start=start, end=end, adjust="none"),
+                desc=code, retries=2, base_delay=1.0,
+            )
+        except Exception:  # noqa: BLE001 交叉核对自身失败 -> fail-safe 按源缺口
+            return True
+        if df is None or len(df) == 0:
+            return False
+        return pd.Timestamp(df["date"].max()) >= pd.Timestamp(start)
+
+    def _index_judge_no_progress(self, old, start: str, end: str) -> tuple[str, str]:
+        """指数窗口未返回新数据（空/全部早于窗口起点）：按交易日历判 stale/uptodate。
+
+        2026-10-30 根因S3: 旧实现空窗+有旧数据无条件「已是最新」，000688.SH 指数
+        停在旧数据而不自知。主要指数每个交易日必然有 bar（无停牌概念），故以
+        交易日历为判定依据：窗口无交易日 -> uptodate；有交易日但源无 bar ->
+        stale（源缺口，入失败清单重试）；日历不可用 -> 保守按 stale（宁误报不漏报）。
+        """
+        if old is None or len(old) == 0:
+            return "nodata", ""
+        if self._window_has_trading_day(start, end) is False:
+            return "uptodate", ""
+        return "stale", (f"指数窗口 {start}~{end} 无新数据（日历含交易日，"
+                         f"疑似数据源缺口，将重试）")
+
+    # ------------------------------------------------ 待修清单 / 单位断裂自愈
+    def _pending_repair_path(self) -> Path:
+        return self.data_dir / f"pending_repair_{self.adjust}.txt"
+
+    def _pending_repair_load(self) -> dict[str, str]:
+        """code -> reason（保持文件内顺序）。"""
+        p = self._pending_repair_path()
+        if not p.exists():
+            return {}
+        out: dict[str, str] = {}
+        for line in p.read_text(encoding="utf-8").splitlines():
+            parts = line.split("\t")
+            if parts and parts[0].strip():
+                out[parts[0].strip()] = parts[2] if len(parts) >= 3 else ""
+        return out
+
+    def _pending_repair_save(self, items: dict[str, str]) -> None:
+        p = self._pending_repair_path()
+        if not items:
+            if p.exists():
+                p.unlink()
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        today = dt.date.today().isoformat()
+        p.write_text("\n".join(f"{c}\t{today}\t{r}" for c, r in items.items()) + "\n",
+                     encoding="utf-8")
+
+    def _pending_repair_add(self, code: str, reason: str) -> None:
+        items = self._pending_repair_load()
+        if code not in items:  # 已在清单中保留首次登记的原因/日期
+            items[code] = reason
+            self._pending_repair_save(items)
+
+    def _pending_repair_remove(self, code: str) -> None:
+        items = self._pending_repair_load()
+        if code in items:
+            del items[code]
+            self._pending_repair_save(items)
+
+    def _full_refetch_one(self, code: str, end: str) -> tuple[bool, str]:
+        """单股全量重拉 [start, end] + 复权单位守卫；成功则合并落盘。"""
+        path = store.daily_dir(self.data_dir, self.adjust) / f"{code}.parquet"
+        old = store.load_daily(path)
+        try:
+            df = with_retry(
+                source.fetch_daily,
+                kwargs=dict(wind_code=code, start=self.start, end=end,
+                            adjust=self.adjust),
+                desc=code,
+            )
+        except Exception as e:  # noqa: BLE001
+            return False, f"{type(e).__name__}: {e}"
+        if df is None or len(df) == 0:
+            return False, "全量重拉无数据"
+        if self.adjust in ("hfq", "qfq"):
+            reason = _reject_unit_anomaly(old, df)
+            if reason:
+                return False, reason
+        store.save_parquet(path, store.merge_daily(old, df))
+        return True, ""
+
+    def _self_heal_full_refetch(self, code: str, end: str,
+                                reason: str) -> tuple[str, str, str]:
+        """增量路径单位守卫命中：登记待修清单 + 立即全量重拉自愈。
+
+        2026-10-30 根因C: 旧实现守卫命中仅标「skipped」，140 只「单位断裂」
+        股票被永久阻塞（每天增量 +36% 假跳变被拒、本地永远停在断裂前一日）。
+        复权因子跨供应商有 ~1% 差异，增量窗口恰跨口径切换日时必中守卫，
+        只有整段重下（单一供应商连续序列）能恢复：
+        1) 记入 data/pending_repair_{adjust}.txt（次日 EOD 自动重试 +
+           CLI `python -m downloader repair` 手动补修）；
+        2) 立即尝试全量重拉 [start, end] 并再过守卫：通过 -> 合并落盘、
+           移出清单、标 repaired；仍失败 -> skipped（留在清单等待 repair）。
+        """
+        self._pending_repair_add(code, reason)
+        ok, msg = self._full_refetch_one(code, end)
+        if ok:
+            self._pending_repair_remove(code)
+            _log(f"{code} 单位断裂自愈成功（全量重拉通过守卫）")
+            return code, "repaired", f"守卫命中（{reason[:60]}）后全量重拉通过"
+        return code, "skipped", f"守卫命中且全量重拉仍失败: {msg}"
+
+    def _update_stock_one(self, code: str, name: str, end: str, full: bool) -> tuple[str, str, str]:
+        path = store.daily_dir(self.data_dir, self.adjust) / f"{code}.parquet"
+        old = store.load_daily(path)
+        start, skip = self._next_start(old, end, full,
+                                       incremental_ok=self.adjust != "qfq",
+                                       mtime=_safe_mtime(path))
+        if skip:
+            return code, skip, ""
+        try:
+            df = with_retry(
+                source.fetch_daily,
+                kwargs=dict(wind_code=code, start=start, end=end, adjust=self.adjust),
+                desc=code,
+            )
+        except Exception as e:  # noqa: BLE001
+            return code, "failed", f"{type(e).__name__}: {e}"
+        last = pd.Timestamp(old["date"].max()) if (old is not None and len(old)) else None
+        # 空窗口，或返回的 bar 全部早于窗口起点（源回退/越界数据）-> 无新数据：
+        # 交叉核对区分停牌与源缺口（2026-10-30 根因A/B）。
+        # 注: 同日重取（start==最后bar日，盘中价收盘覆盖场景）max==起点 属正常，放行。
+        if (df is None or len(df) == 0
+                or (last is not None
+                    and pd.Timestamp(df["date"].max()) < pd.Timestamp(start))):
+            return self._judge_no_progress(code, old, last, start, end)
+        if self.adjust in ("hfq", "qfq"):
+            reason = _reject_unit_anomaly(old, df)
+            if reason:
+                _log(f"跳过 {code}: {reason} -> 转全量重拉自愈")
+                return self._self_heal_full_refetch(code, end, reason)
+        merged = store.merge_daily(old, df)
+        store.save_parquet(path, merged)
+        return code, ("new" if last is None else "updated"), ""
+
     def _next_start(self, old, end: str, full: bool, incremental_ok: bool,
                     mtime: Optional[float] = None) -> tuple[str, str]:
         """返回 (起始日期, 跳过状态)。跳过状态非空表示无需下载。
@@ -282,33 +550,6 @@ class Downloader:
             return self.start, ""
         return nxt, ""
 
-    def _update_stock_one(self, code: str, name: str, end: str, full: bool) -> tuple[str, str, str]:
-        path = store.daily_dir(self.data_dir, self.adjust) / f"{code}.parquet"
-        old = store.load_daily(path)
-        start, skip = self._next_start(old, end, full,
-                                       incremental_ok=self.adjust != "qfq",
-                                       mtime=_safe_mtime(path))
-        if skip:
-            return code, skip, ""
-        try:
-            df = with_retry(
-                source.fetch_daily,
-                kwargs=dict(wind_code=code, start=start, end=end, adjust=self.adjust),
-                desc=code,
-            )
-        except Exception as e:  # noqa: BLE001
-            return code, "failed", f"{type(e).__name__}: {e}"
-        if df is None or len(df) == 0:
-            return (code, "uptodate", "") if old is not None and len(old) else (code, "nodata", "")
-        if self.adjust in ("hfq", "qfq"):
-            reason = _reject_unit_anomaly(old, df)
-            if reason:
-                _log(f"跳过 {code}: {reason}")
-                return code, "skipped", reason
-        merged = store.merge_daily(old, df)
-        store.save_parquet(path, merged)
-        return code, ("new" if old is None or len(old) == 0 else "updated"), ""
-
     def update_stocks(
         self,
         codes=None,
@@ -317,14 +558,21 @@ class Downloader:
         market: str = "all",
         limit: Optional[int] = None,
         on_progress=None,
+        lag_retry_delay: float = 180.0,
     ) -> dict:
-        """on_progress(done, total): 每完成一只回调一次（供 EOD 看门狗采集心跳）。"""
+        """on_progress(done, total): 每完成一只回调一次（供 EOD 看门狗采集心跳）。
+
+        lag_retry_delay: 主遍结束后对「源缺数据(stale)」股票的冷却重试秒数
+        （默认 180s；0 表示不冷却立即重试）。EOD 起跑早于数据源生成当日 bar 的
+        时段，冷却后仅对 stale 批次再跑一遍，同一轮内自愈（2026-10-30 事故）。
+        """
         end = _norm_end(end)
-        stock_list = self._stock_list()
         if codes:
             uniq = list(dict.fromkeys(_split_codes(codes)))
             targets = [(to_wind_code(c), "") for c in uniq]
         else:
+            # 仅在需要全市场队列时才取列表（缺失会触网刷新），codes 分支不用它
+            stock_list = self._stock_list()
             base = stock_list
             if market and market != "all":
                 base = base[base["code"].str.endswith("." + market.upper())]
@@ -348,10 +596,10 @@ class Downloader:
         if self.adjust == "qfq":
             _log("提示: 前复权数据每次都会整段重新下载（历史随分红重写），建模推荐用后复权(hfq)。")
 
-        stats = {"new": 0, "updated": 0, "uptodate": 0, "nodata": 0, "failed": 0, "skipped": 0}
-        failures: list[tuple[str, str]] = []
+        results: dict[str, tuple[str, str]] = {}
         t0 = time.time()
         total = len(targets)
+        done = 0
         pool = ThreadPoolExecutor(max_workers=self.workers)
         try:
             futs = {
@@ -361,12 +609,9 @@ class Downloader:
             prog = as_completed(futs)
             if tqdm is not None:
                 prog = tqdm(prog, total=len(futs), desc="A股日线", unit="只")
-            done = 0
             for fut in prog:
                 code, status, msg = fut.result()
-                stats[status] = stats.get(status, 0) + 1
-                if status == "failed":
-                    failures.append((code, msg))
+                results[code] = (status, msg)
                 done += 1
                 if on_progress is not None:
                     try:
@@ -380,6 +625,41 @@ class Downloader:
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
+        # 运行内二次重试: 主遍 stale（源缺数据，非网络故障）的股票，其源窗口
+        # 空可能是时段性未生成（EOD 15:50 起跑 vs 数据源 bar 生成时差）。
+        # 冷却 lag_retry_delay 秒后仅对该批次再跑一遍；仍 stale 的留在失败
+        # 清单，次日重跑同一命令自动重试。
+        stale_codes = [c for c, (s, _m) in results.items() if s == "stale"]
+        if stale_codes:
+            if lag_retry_delay > 0:
+                _log(f"{len(stale_codes)} 只股票源无新数据（疑似源空窗），"
+                     f"冷却 {lag_retry_delay:.0f}s 后二次重试……")
+                time.sleep(lag_retry_delay)
+            pool2 = ThreadPoolExecutor(max_workers=self.workers)
+            futs2 = {pool2.submit(self._update_stock_one, c, "", end, full): c
+                     for c in stale_codes}
+            try:
+                for fut2 in as_completed(futs2):
+                    code, status, msg = fut2.result()
+                    results[code] = (status, msg)
+                    done += 1
+                    if on_progress is not None:
+                        try:
+                            on_progress(done, total + len(stale_codes))
+                        except Exception:  # noqa: BLE001
+                            pass
+            except KeyboardInterrupt:
+                _log("用户中断，取消剩余任务……")
+                for f in futs2:
+                    f.cancel()
+            finally:
+                pool2.shutdown(wait=False, cancel_futures=True)
+
+        # 按最终状态单次计数（二次重试覆盖首遍 stale，避免双计）
+        stats = {k: 0 for k in _STAT_LABEL}
+        for _c, (status, _m) in results.items():
+            stats[status] = stats.get(status, 0) + 1
+        failures = [(c, m) for c, (s, m) in results.items() if s in ("failed", "stale")]
         self._report(stats, failures, kind="stocks")
         _log(f"耗时 {time.time() - t0:.0f}s")
         return stats
@@ -399,6 +679,50 @@ class Downloader:
                     "请稍后（数分钟~1小时）重跑同一命令补齐，或先降低 --rate/--workers。"
                 )
 
+    # ------------------------------------------------ 单位断裂修复（repair）
+    def repair_stocks(self, codes=None, force: bool = False, end=None) -> dict:
+        """修复「单位断裂」股票：全量重拉 [start, end] + 复权单位守卫。
+
+        目标 = 待修清单 data/pending_repair_{adjust}.txt ∪ --codes 指定代码。
+        - 指定代码无清单记录且无本地数据文件时跳过（防误敲），--force 放行；
+        - 成功 -> 合并落盘、移出清单、计 repaired；
+        - 失败 -> 登记/保留在清单（次日 EOD 与本命令自动重试）、计 failed。
+        """
+        end = _norm_end(end)
+        ddir = store.daily_dir(self.data_dir, self.adjust)
+        items = self._pending_repair_load()
+        targets = list(items.keys())
+        stats = {"repaired": 0, "failed": 0, "skipped": 0}
+        if codes:
+            for c in dict.fromkeys(to_wind_code(x) for x in _split_codes(codes)):
+                if c in targets:
+                    continue
+                if not force and not (ddir / f"{c}.parquet").exists():
+                    _log(f"跳过 {c}: 无待修清单记录且无本地数据文件（加 --force 强制整段重拉）")
+                    stats["skipped"] += 1
+                    continue
+                targets.append(c)
+        if not targets:
+            _log("没有需要修复的股票（待修清单为空，或指定代码均被跳过）。")
+            if any(stats.values()):
+                self._report(stats, [], kind="repair")
+            return stats
+        _log(f"修复 {len(targets)} 只股票（全量重拉 [{self.start}..{end}] + 单位守卫）")
+        failures: list[tuple[str, str]] = []
+        for code in targets:
+            ok, msg = self._full_refetch_one(code, end)
+            if ok:
+                self._pending_repair_remove(code)
+                stats["repaired"] += 1
+                _log(f"  {code} 修复成功（全量重拉通过守卫）")
+            else:
+                self._pending_repair_add(code, f"修复失败: {msg}")
+                stats["failed"] += 1
+                failures.append((code, msg))
+                _log(f"  {code} 修复失败: {msg}（留在待修清单，下次自动重试）")
+        self._report(stats, failures, kind="repair")
+        return stats
+
     # ------------------------------------------------ 指数日线
     def update_indices(self, indices=None, end=None, full: bool = False) -> dict:
         end = _norm_end(end)
@@ -406,7 +730,8 @@ class Downloader:
             targets = list(dict.fromkeys(to_wind_code(i) for i in _split_codes(indices)))
         else:
             targets = list(config.MAJOR_INDICES)
-        stats = {"new": 0, "updated": 0, "uptodate": 0, "nodata": 0, "failed": 0}
+        stats = {"new": 0, "updated": 0, "uptodate": 0, "nodata": 0,
+                 "failed": 0, "stale": 0}
         failures = []
         for code in targets:
             name = config.MAJOR_INDICES.get(code, "")
@@ -418,6 +743,12 @@ class Downloader:
                 stats[skip] += 1
                 _log(f"  {code} {name}: 已是最新")
                 continue
+            # 窗口无交易日（日历给出确定 False）-> 直接 uptodate，不发请求
+            if old is not None and len(old) > 0 and not full \
+                    and self._window_has_trading_day(start, end) is False:
+                stats["uptodate"] += 1
+                _log(f"  {code} {name}: 窗口无交易日，已是最新")
+                continue
             try:
                 df = with_retry(
                     source.fetch_index_daily,
@@ -428,8 +759,14 @@ class Downloader:
                 stats["failed"] += 1
                 failures.append((code, f"{type(e).__name__}: {e}"))
                 continue
-            if df is None or len(df) == 0:
-                stats["nodata" if old is None else "uptodate"] += 1
+            no_new = (df is None or len(df) == 0
+                      or (old is not None and len(old) > 0
+                          and pd.Timestamp(df["date"].max()) < pd.Timestamp(start)))
+            if no_new:
+                status, msg = self._index_judge_no_progress(old, start, end)
+                stats[status] += 1
+                if status == "stale":
+                    failures.append((code, msg))
                 continue
             merged = store.merge_daily(old, df)
             store.save_parquet(path, merged)

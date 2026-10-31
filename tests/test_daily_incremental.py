@@ -154,8 +154,9 @@ def test_new_stocks_sorted_first():
 def test_refresh_stock_list_writes_basic_copy():
     """refresh_stock_list 必须同步落 dataset/stock_basic 副本（不再依赖 EOD 跑到第 7 阶段）。"""
     with tempfile.TemporaryDirectory() as tmp:
-        df = pd.DataFrame({"code": ["000001.SZ", "301718.SZ"],
-                           "name": ["平安银行", "新股A"]})
+        # 列表需通过写盘完整性守卫（首次写入 floor: 行数 >= 3000）
+        codes = ["000001.SZ", "301718.SZ"] + [f"600{i:03d}.SH" for i in range(3000)]
+        df = pd.DataFrame({"code": codes, "name": ["测试"] * len(codes)})
         import downloader.source as source_mod
         from downloader.ratelimit import with_retry as _wr
         orig = source_mod.fetch_stock_list
@@ -178,7 +179,8 @@ def test_refresh_stock_list_writes_basic_copy():
         basic = store.dataset_dir(tmp) / "stock_basic.parquet"
         assert basic.exists(), "stock_basic 副本未随列表刷新"
         got = pd.read_parquet(basic)
-        assert list(got["code"]) == ["000001.SZ", "301718.SZ"]
+        assert codes[0] in set(got["code"]) and codes[1] in set(got["code"])
+        assert len(got) == len(codes)
 
 
 # ----------------------------------------------------------------- 4. 盘中定期刷列表

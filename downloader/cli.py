@@ -7,6 +7,7 @@
     python -m downloader stocks --codes 600519,000858
     python -m downloader stocks --start 20180101 --adjust qfq
     python -m downloader index
+    python -m downloader repair --codes 600900.SH   # 修复单位断裂股（默认处理待修清单）
     python -m downloader build              # 合并为单个建模数据集
     python -m downloader status
 """
@@ -98,6 +99,18 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--market", default="all", choices=["all", "sh", "sz", "bj"], help="限定市场")
     pa.add_argument("--limit", type=int, default=None, help="只处理前 N 只（调试用）")
 
+    pr = sub.add_parser(
+        "repair",
+        help="修复「单位断裂」股票：全量重拉+单位守卫（默认处理待修清单 pending_repair_*.txt）",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    _add_common(pr, with_range=True)
+    pr.add_argument("--end", default=None, help="结束日期 YYYYMMDD（默认今天）")
+    pr.add_argument("--codes", default=None,
+                    help="追加指定修复代码，逗号分隔，如 600900.SH；修复失败留入待修清单")
+    pr.add_argument("--force", action="store_true",
+                    help="允许无待修清单记录且无本地数据文件的任意代码（强制整段重拉）")
+
     pp = sub.add_parser("proxy", help="查看/切换 Clash 出口节点（配合 --rotate 使用）",
                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     pp.add_argument("--list", action="store_true", help="列出可选节点")
@@ -181,12 +194,18 @@ def main(argv=None) -> None:
         )
     elif args.cmd == "index":
         dl.update_indices(indices=args.indices, end=args.end, full=args.full)
+    elif args.cmd == "repair":
+        dl.repair_stocks(codes=args.codes, force=args.force, end=args.end)
     elif args.cmd == "build":
         dl.build_dataset()
     elif args.cmd == "status":
         dl.status()
     elif args.cmd == "all":
-        dl.refresh_stock_list()
+        try:
+            dl.refresh_stock_list()
+        except Exception as e:  # noqa: BLE001
+            # 列表刷新失败（含完整性守卫拒绝）不阻塞：后续全市场更新沿用本地旧列表
+            _log(f"股票列表刷新失败（沿用本地旧列表）: {e}")
         try:
             dl.refresh_trade_calendar()
         except Exception as e:  # noqa: BLE001

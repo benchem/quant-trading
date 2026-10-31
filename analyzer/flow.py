@@ -72,11 +72,12 @@ def _norm_code(code: str) -> tuple[str, str]:
     return sym, suf
 
 
-def _fetch(sym: str, market: str, retries: int = 2) -> list[dict]:
+def _fetch(sym: str, market: str, retries: int = 4) -> list[dict]:
     """调 AkShare 拉全量历史，规范化为 items（旧->新）。
 
-    东财 push2his 偶发瞬断（RemoteDisconnected），akshare 内部不重试，
-    这里补一层指数退避（与 downloader 的容错风格一致）。
+    东财 push2his 间歇性不可达（2026-10-30 事故整晚 curl exit=56），akshare 内部
+    不重试，这里补一层指数退避 2/4/8/16s（旧: retries=2、1.5/3.0s，对整晚故障窗口
+    覆盖不足）。
     """
     import time as _time
 
@@ -91,7 +92,7 @@ def _fetch(sym: str, market: str, retries: int = 2) -> list[dict]:
         except Exception as e:  # noqa: BLE001 瞬断重试
             last_err = e
             if attempt < retries:
-                _time.sleep(1.5 * (attempt + 1))
+                _time.sleep(2.0 * (2 ** attempt))
     if df is None:
         raise last_err  # type: ignore[misc]
     items: list[dict] = []
@@ -132,11 +133,13 @@ def _f(v):
 
 
 def fetch(code: str, root: str | Path, refresh: bool = False,
-          keep_days: int = KEEP_DAYS) -> dict:
+          keep_days: int = KEEP_DAYS, strict: bool = False) -> dict:
     """读取（或抓取）个股资金流，返回 {code, items, fetched_at, stale}。
 
     - 本地缓存未过期且非 refresh -> 直接返回；
-    - 抓取失败 -> 回退旧缓存（stale=True）；旧缓存也没有 -> 抛 RuntimeError。
+    - 抓取失败 -> 回退旧缓存（stale=True）；旧缓存也没有 -> 抛 RuntimeError；
+    - strict=True（EOD 刷新链路）: 抓取失败必须抛错而不是静默回退旧缓存——
+      回退会正常返回，调用方无任何感知，数据可无限期陈旧（2026-10-30 根因S4）。
     """
     code = str(code).upper()
     sym, market = _norm_code(code)
@@ -154,7 +157,9 @@ def fetch(code: str, root: str | Path, refresh: bool = False,
         items = _fetch(sym, market)
     except ImportError as e:
         raise RuntimeError(f"akshare 未安装: {e}") from None
-    except Exception as e:  # noqa: BLE001 网络失败回退旧缓存
+    except Exception as e:  # noqa: BLE001
+        if strict:
+            raise RuntimeError(f"资金流抓取失败 (strict): {str(e)[:200]}") from None
         if cached and cached.get("items"):
             out = dict(cached)
             out["stale"] = True

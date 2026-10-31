@@ -86,6 +86,9 @@ class FakeDownloader:
         return self._c("update_stocks_watchlist" if codes else "update_stocks",
                        {"updated": 2, "uptodate": 1})
 
+    def repair_stocks(self, codes=None, force=False, end=None):
+        return self._c("repair_stocks", {"repaired": 1})
+
     def update_indices(self):
         return self._c("update_indices", {"updated": 7})
 
@@ -268,13 +271,14 @@ def t_stage_order_watchlist_first():
         up, dl, nc, store = _mk_updater(Path(d), ["600519.SH", "300687.SZ"])
         st = up.run_now()
         assert dl.calls == ["refresh_stock_list", "refresh_trade_calendar",
-                            "update_stocks_watchlist", "update_stocks",
+                            "update_stocks_watchlist", "update_stocks", "repair_stocks",
                             "update_indices", "refresh_boards", "build_dataset"], dl.calls
         assert st["running"] is False
         assert st["errors"] == []
         assert store.reload_calls == 1
         assert st["stats"]["wl_updated"] == 2      # 自选股统计独立
         assert st["stats"]["updated"] == 9         # 全市场 2 + 指数 7 合并
+        assert st["stats"]["repaired"] == 1        # 单位断裂修复步骤已执行
         day = st["day"]
         msgs = {m["key"] for m in nc.list()["messages"]}
         assert f"update:start:{day}" in msgs
@@ -293,6 +297,17 @@ def t_stage_error_continues():
         day = st["day"]
         assert any(m["key"] == f"update:error:{day}" and m["level"] == "warn"
                    for m in nc.list()["messages"])
+
+
+def t_repair_step_failure_continues():
+    """单位断裂修复步骤失败：记错不中断，后续阶段照常执行。"""
+    with tempfile.TemporaryDirectory() as d:
+        up, dl, nc, _ = _mk_updater(
+            Path(d), ["600519.SH"], dl_kwargs={"fail": ("repair_stocks",)})
+        st = up.run_now()
+        assert "update_indices" in dl.calls and "build_dataset" in dl.calls
+        assert len(st["errors"]) == 1, st["errors"]
+        assert "单位断裂修复" in st["errors"][0]
 
 
 def t_signal_notify_integration():
@@ -513,6 +528,7 @@ def main() -> int:
         ("扫描: 插件异常隔离", t_scan_crash_isolation),
         ("链路: 阶段顺序自选股优先", t_stage_order_watchlist_first),
         ("链路: 单阶段失败不中断", t_stage_error_continues),
+        ("链路: 单位断裂修复失败不中断", t_repair_step_failure_continues),
         ("链路: 信号->消息提醒", t_signal_notify_integration),
         ("调度: 单例锁与同日重跑拒绝", t_trigger_singleton),
         ("接口: reload/清缓存存在", t_datastore_reload_api),

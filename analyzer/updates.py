@@ -329,7 +329,8 @@ class EodUpdater:
             return self._downloader_factory()
         from downloader.app import Downloader
 
-        return Downloader(data_dir=self.data_dir, adjust="hfq")
+        # mode=auto: 探测三新源健康则多源分批（全部不可用自动回退串行链路）
+        return Downloader(data_dir=self.data_dir, adjust="hfq", mode="auto")
 
     def _wl_codes(self) -> list[str]:
         try:

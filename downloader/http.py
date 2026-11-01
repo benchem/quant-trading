@@ -40,21 +40,27 @@ class HttpClient:
         self.limiter = RateLimiter(rate)
 
     # ------------------------------------------------ 各引擎实现
-    def _engine_requests(self, url: str, params: dict) -> bytes:
-        r = _requests.get(url, params=params, timeout=self.timeout)
+    # headers/timeout 为可选透传参数（2026-11 多源扩展：新浪必须带 Referer、
+    # 探测请求需要 5s 短超时）；不传时行为与旧签名完全一致。
+    def _engine_requests(self, url: str, params: dict,
+                         headers: Optional[dict] = None, timeout: Optional[float] = None) -> bytes:
+        r = _requests.get(url, params=params, timeout=timeout or self.timeout,
+                          headers=headers)
         if r.status_code in RateLimitedError.BLOCK_CODES:
             raise RateLimitedError(r.status_code)
         if r.status_code >= 400:
             raise FetchError(f"HTTP {r.status_code}")
         return r.content
 
-    def _engine_curl_cffi(self, url: str, params: dict) -> bytes:
+    def _engine_curl_cffi(self, url: str, params: dict,
+                          headers: Optional[dict] = None, timeout: Optional[float] = None) -> bytes:
         from curl_cffi import requests as cr
 
         last: Optional[Exception] = None
         for imp in ("chrome", "chrome124", "chrome120", "chrome110"):
             try:
-                r = cr.get(url, params=params, timeout=self.timeout, impersonate=imp)
+                r = cr.get(url, params=params, timeout=timeout or self.timeout,
+                           impersonate=imp, headers=headers)
                 if r.status_code in RateLimitedError.BLOCK_CODES:
                     raise RateLimitedError(r.status_code)
                 if r.status_code >= 400:
@@ -64,7 +70,8 @@ class HttpClient:
                 last = e
         raise FetchError(f"curl_cffi 全部指纹失败: {last}")
 
-    def _engine_tls_client(self, url: str, params: dict) -> bytes:
+    def _engine_tls_client(self, url: str, params: dict,
+                           headers: Optional[dict] = None, timeout: Optional[float] = None) -> bytes:
         import tls_client
 
         last: Optional[Exception] = None
@@ -72,7 +79,8 @@ class HttpClient:
             sess = None
             try:
                 sess = tls_client.Session(client_identifier=ident)
-                r = sess.get(url, params=params, timeout=self.timeout)
+                r = sess.get(url, params=params, timeout=timeout or self.timeout,
+                             headers=headers)
                 if r.status_code in RateLimitedError.BLOCK_CODES:
                     raise RateLimitedError(r.status_code)
                 if r.status_code >= 400:
@@ -88,13 +96,17 @@ class HttpClient:
                         pass
         raise FetchError(f"tls_client 全部指纹失败: {last}")
 
-    def _engine_curl(self, url: str, params: dict) -> bytes:
+    def _engine_curl(self, url: str, params: dict,
+                     headers: Optional[dict] = None, timeout: Optional[float] = None) -> bytes:
         exe = shutil.which("curl")
         if not exe:
             raise FetchError("系统未找到 curl 命令")
         full = url + ("?" + urlencode(params) if params else "")
-        cmd = [exe, "-sS", "--compressed", "-m", str(max(5, int(self.timeout))), full]
-        p = subprocess.run(cmd, capture_output=True, timeout=self.timeout + 10)
+        t = timeout or self.timeout
+        cmd = [exe, "-sS", "--compressed", "-m", str(max(5, int(t))), full]
+        for k, v in (headers or {}).items():
+            cmd[1:1] = ["-H", f"{k}: {v}"]
+        p = subprocess.run(cmd, capture_output=True, timeout=t + 10)
         if p.returncode != 0 or not p.stdout:
             err = p.stderr.decode("utf-8", "ignore")
             # curl 遇到 4xx/5xx 时退出码 22，错误信息形如 "The requested URL returned error: 501"
@@ -106,14 +118,16 @@ class HttpClient:
             raise FetchError(f"curl exit={p.returncode}: {err[:120]}")
         return p.stdout
 
-    def _fetch(self, engine: str, url: str, params: dict) -> bytes:
-        self.limiter.wait()  # 统一限速：所有源、所有引擎、所有重试
+    def _fetch(self, engine: str, url: str, params: dict,
+               headers: Optional[dict] = None, limiter: Optional[RateLimiter] = None,
+               timeout: Optional[float] = None) -> bytes:
+        (limiter or self.limiter).wait()  # 限速：默认全局；多源模式下按源独立限速
         if self.heartbeat is not None:
             try:
                 self.heartbeat()  # 网络活跃心跳（EOD 看门狗用：区分「慢」与「死」）
             except Exception:  # noqa: BLE001
                 pass
-        return getattr(self, f"_engine_{engine}")(url, params)
+        return getattr(self, f"_engine_{engine}")(url, params, headers=headers, timeout=timeout)
 
     # ------------------------------------------------ 引擎探测与选择
     @staticmethod
@@ -159,14 +173,17 @@ class HttpClient:
             raise FetchError("没有任何可用的 HTTP 引擎（requests / curl_cffi / tls_client / curl 均失败）")
 
     # ------------------------------------------------ 对外接口
-    def get(self, url: str, params: Optional[dict] = None) -> bytes:
+    def get(self, url: str, params: Optional[dict] = None,
+            headers: Optional[dict] = None, limiter: Optional[RateLimiter] = None,
+            timeout: Optional[float] = None) -> bytes:
         params = params or {}
         first = self.select_engine()
         order = [first] + [e for e in self.ENGINES if e != first]
         last: Optional[Exception] = None
         for name in order:
             try:
-                return self._fetch(name, url, params)
+                return self._fetch(name, url, params, headers=headers,
+                                   limiter=limiter, timeout=timeout)
             except RateLimitedError:
                 # 限流针对 IP，换引擎（同 IP）无意义：立即上抛，交给上层冷却
                 raise
@@ -174,5 +191,8 @@ class HttpClient:
                 last = e
         raise FetchError(f"请求失败 {url}: {last}")
 
-    def get_json(self, url: str, params: Optional[dict] = None) -> Any:
-        return json.loads(self.get(url, params).decode("utf-8"))
+    def get_json(self, url: str, params: Optional[dict] = None,
+                 headers: Optional[dict] = None, limiter: Optional[RateLimiter] = None,
+                 timeout: Optional[float] = None) -> Any:
+        return json.loads(self.get(url, params, headers=headers, limiter=limiter,
+                                   timeout=timeout).decode("utf-8"))

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -10,10 +11,12 @@ from typing import Optional
 
 import pandas as pd
 
-from . import config, source, store
+from . import config, source, store, vendors
 from .codes import to_wind_code
 from .errors import FetchError
 from .ratelimit import with_retry
+from .scheduler import (AllSourcesUnavailableError, MultiSourceScheduler,
+                        build_source_units, probe_units)
 
 try:
     from tqdm import tqdm
@@ -33,6 +36,19 @@ def _norm_end(end) -> str:
 
 def _split_codes(s: str) -> list[str]:
     return [x for x in re.split(r"[,，;\s]+", str(s).strip()) if x]
+
+
+#: 待修清单读写锁：增量自愈/多源工作线程与 repair 主循环会并发增删登记。
+_REPAIR_LOCK = threading.RLock()
+
+#: 守卫原因串里的断裂日（如 "疑似复权单位断裂: 2026-10-28 单日|涨跌|32.1%…"）。
+_BREAK_DATE_RE = re.compile(r"疑似复权单位断裂:\s*(\d{4}-\d{2}-\d{2})")
+
+
+def _break_date_from_reason(reason: str) -> Optional[str]:
+    """守卫原因串提取断裂日（YYYYMMDD）；无匹配返回 None（按整段处理）。"""
+    m = _BREAK_DATE_RE.search(reason or "")
+    return m.group(1).replace("-", "") if m else None
 
 
 #: 复权序列单日|跳变|超过该值视为复权单位断裂（涨跌停上限: 主板10%/创业板科创板20%/北交所30%）
@@ -196,8 +212,14 @@ def _stock_list_guard(new: pd.DataFrame, old: Optional[pd.DataFrame]) -> str:
 
 
 class Downloader:
+    #: 类级默认（供 Downloader.__new__ 直构的离线单测替身继承）：串行链路，
+    #: 零探测零回归。生产入口（CLI / EOD）显式传 mode="auto" 启用多源分批。
+    mode = "serial"
+    #: 同花顺锚定全量重拉是否可用（auto 模式下由探测结果决定；serial 恒 False）
+    _ths_enabled = False
+
     def __init__(self, data_dir="data", adjust=None, start=None, workers=None, rate=None,
-                 rotate: bool = False):
+                 rotate: bool = False, mode: str = "serial"):
         self.data_dir = Path(data_dir)
         self.adjust = adjust or config.DEFAULT_ADJUST
         self.start = (start or config.DEFAULT_START).replace("-", "")
@@ -209,6 +231,7 @@ class Downloader:
         self.rotator = None
         if rotate:
             self.rotator = _make_rotator()
+        self.mode = mode
 
     # ------------------------------------------------ 股票列表 / 交易日历
     def refresh_stock_list(self) -> pd.DataFrame:
@@ -437,19 +460,82 @@ class Downloader:
                      encoding="utf-8")
 
     def _pending_repair_add(self, code: str, reason: str) -> None:
-        items = self._pending_repair_load()
-        if code not in items:  # 已在清单中保留首次登记的原因/日期
-            items[code] = reason
-            self._pending_repair_save(items)
+        with _REPAIR_LOCK:
+            items = self._pending_repair_load()
+            if code not in items:  # 已在清单中保留首次登记的原因/日期
+                items[code] = reason
+                self._pending_repair_save(items)
 
     def _pending_repair_remove(self, code: str) -> None:
-        items = self._pending_repair_load()
-        if code in items:
-            del items[code]
-            self._pending_repair_save(items)
+        with _REPAIR_LOCK:
+            items = self._pending_repair_load()
+            if code in items:
+                del items[code]
+                self._pending_repair_save(items)
 
-    def _full_refetch_one(self, code: str, end: str) -> tuple[bool, str]:
-        """单股全量重拉 [start, end] + 复权单位守卫；成功则合并落盘。"""
+    def _pending_repair_clear_fixed(self, code: str) -> None:
+        """增量更新成功且过守卫 -> 断裂嫌疑解除，移出待修清单（懒加载缓存）。
+
+        多源工作线程并发调用：读侧走实例缓存（首次加载后只查集合），
+        写侧复用 _pending_repair_remove 的锁。清单为空时零开销。
+        """
+        cache = getattr(self, "_repair_fixed_cache", None)
+        if cache is None:
+            with _REPAIR_LOCK:
+                try:
+                    cache = set(self._pending_repair_load())
+                except Exception:  # noqa: BLE001 清单读失败按空处理
+                    cache = set()
+            self._repair_fixed_cache = cache
+        if code not in cache:
+            return
+        try:
+            self._pending_repair_remove(code)
+            cache.discard(code)
+            _log(f"{code} 增量过守卫，移出待修清单")
+        except Exception:  # noqa: BLE001 清理失败不影响主链路
+            pass
+
+    def _ths_anchored_refetch(self, code: str, end: str,
+                              from_date: Optional[str] = None) -> tuple[bool, str]:
+        """THS 锚定重拉：from_date 起的窗口替换（None = [start, end] 整段）。
+
+        qfq × 断裂前存量比值 -> 存量基准 hfq。from_date（修复路径 = 断裂日）时：
+        比值只用 from_date 之前的存量好 bar（断裂后存量基准已污染），返回窗口
+        从 from_date 起——merge_daily 只覆盖窗口内日期，断裂日之前的存量历史
+        原值保留（2026-11-01 实测：存量多供应商拼接，全史比值漂移 ±2%，
+        整段缩放会打歪历史段，必须按断裂日局部锚定）。
+        """
+        path = store.daily_dir(self.data_dir, self.adjust) / f"{code}.parquet"
+        old = store.load_daily(path)
+        start = str(from_date).replace("-", "") if from_date else self.start
+        try:
+            df = vendors.fetch_ths_hfq(code, start, end, old, full=True,
+                                       anchor_before=from_date)
+        except Exception as e:  # noqa: BLE001
+            return False, f"{type(e).__name__}: {e}"
+        if df is None or len(df) == 0:
+            return False, "THS 全量重拉无数据"
+        if self.adjust in ("hfq", "qfq"):
+            reason = _reject_unit_anomaly(old, df)
+            if reason:
+                return False, reason
+        store.save_parquet(path, store.merge_daily(old, df))
+        return True, ""
+
+    def _full_refetch_one(self, code: str, end: str,
+                          from_date: Optional[str] = None) -> tuple[bool, str]:
+        """单股全量重拉 + 复权单位守卫；成功则落盘。
+
+        同花顺可用（auto 模式探测健康）时优先 THS 锚定（from_date 起局部替换，
+        断裂前历史原值保留）；失败回退既有 em/tx/bs 全量重拉（合并写，现状行为，
+        恒整段 [start, end]）。
+        """
+        if self._ths_enabled:
+            ok, msg = self._ths_anchored_refetch(code, end, from_date)
+            if ok:
+                return True, ""
+            _log(f"{code} THS 锚定全量重拉失败，回退旧链路: {msg}")
         path = store.daily_dir(self.data_dir, self.adjust) / f"{code}.parquet"
         old = store.load_daily(path)
         try:
@@ -484,14 +570,21 @@ class Downloader:
            移出清单、标 repaired；仍失败 -> skipped（留在清单等待 repair）。
         """
         self._pending_repair_add(code, reason)
-        ok, msg = self._full_refetch_one(code, end)
+        ok, msg = self._full_refetch_one(code, end, _break_date_from_reason(reason))
         if ok:
             self._pending_repair_remove(code)
             _log(f"{code} 单位断裂自愈成功（全量重拉通过守卫）")
             return code, "repaired", f"守卫命中（{reason[:60]}）后全量重拉通过"
         return code, "skipped", f"守卫命中且全量重拉仍失败: {msg}"
 
-    def _update_stock_one(self, code: str, name: str, end: str, full: bool) -> tuple[str, str, str]:
+    def _update_stock_one(self, code: str, name: str, end: str, full: bool,
+                          fetch_fn=None) -> tuple[str, str, str]:
+        """更新单只股票；fetch_fn 提供时走多源分批单元（否则既有串行链路）。
+
+        fetch_fn 签名 (code, start, end, old, full) -> DataFrame：
+        - 不包 with_retry（调度器的跨源重派即重试）；
+        - old 为本地存量（锚定换算用），full 表示整段重拉（--full / 修复）。
+        """
         path = store.daily_dir(self.data_dir, self.adjust) / f"{code}.parquet"
         old = store.load_daily(path)
         start, skip = self._next_start(old, end, full,
@@ -500,11 +593,14 @@ class Downloader:
         if skip:
             return code, skip, ""
         try:
-            df = with_retry(
-                source.fetch_daily,
-                kwargs=dict(wind_code=code, start=start, end=end, adjust=self.adjust),
-                desc=code,
-            )
+            if fetch_fn is None:
+                df = with_retry(
+                    source.fetch_daily,
+                    kwargs=dict(wind_code=code, start=start, end=end, adjust=self.adjust),
+                    desc=code,
+                )
+            else:
+                df = fetch_fn(code, start, end, old, full)
         except Exception as e:  # noqa: BLE001
             return code, "failed", f"{type(e).__name__}: {e}"
         last = pd.Timestamp(old["date"].max()) if (old is not None and len(old)) else None
@@ -522,6 +618,7 @@ class Downloader:
                 return self._self_heal_full_refetch(code, end, reason)
         merged = store.merge_daily(old, df)
         store.save_parquet(path, merged)
+        self._pending_repair_clear_fixed(code)  # 增量过守卫 -> 断裂嫌疑解除
         return code, ("new" if last is None else "updated"), ""
 
     def _next_start(self, old, end: str, full: bool, incremental_ok: bool,
@@ -550,6 +647,93 @@ class Downloader:
             return self.start, ""
         return nxt, ""
 
+    # ------------------------------------------------ 多源分批调度（2026-11）
+    def _multisource_ready(self, mode: str) -> bool:
+        """auto 模式探测三新源（每源 1 次轻量请求）：任一健康才启用分批。
+
+        - 全部新源不可用 -> 完整退回既有串行链路（零回归路径）；
+        - 同花顺健康则记 _ths_enabled，供单位断裂修复优先 THS 锚定全量重拉；
+        - qfq/none 文件口径不做锚定换算，保持现状串行路径。
+        """
+        self._ths_enabled = False
+        if mode == "serial":
+            return False
+        if self.adjust != "hfq":
+            return False
+        healthy = probe_units([u for u in build_source_units(self.adjust) if u.needs_old])
+        self._ths_enabled = any(u.name == "ths" for u in healthy)
+        return bool(healthy)
+
+    def _run_serial(self, targets, end, full, on_progress=None,
+                    base_done: int = 0, total: Optional[int] = None):
+        """既有串行链路一遍（ThreadPoolExecutor + with_retry em->tx->bs 降级）。"""
+        total = len(targets) if total is None else total
+        results: dict[str, tuple[str, str]] = {}
+        done = base_done
+        pool = ThreadPoolExecutor(max_workers=self.workers)
+        try:
+            futs = {
+                pool.submit(self._update_stock_one, c, n, end, full): c
+                for c, n in targets
+            }
+            prog = as_completed(futs)
+            if tqdm is not None:
+                prog = tqdm(prog, total=len(futs), desc="A股日线", unit="只")
+            for fut in prog:
+                code, status, msg = fut.result()
+                results[code] = (status, msg)
+                done += 1
+                if on_progress is not None:
+                    try:
+                        on_progress(done, total)
+                    except Exception:  # noqa: BLE001 心跳回调绝不影响主链路
+                        pass
+        except KeyboardInterrupt:
+            _log("用户中断，取消剩余任务……")
+            for f in futs:
+                f.cancel()
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return results
+
+    def _run_batch(self, targets, end, full, on_progress=None):
+        """多源分批一遍（2026-11）：探测健康源 round-robin 分批 + 失败跨源重派。
+
+        新股（无本地文件，THS/raw 无法锚定）单独走 em/tx 池（needs_old 过滤），
+        避免烧光每股跨源次数；存量股走五源池。
+        """
+        ddir = store.daily_dir(self.data_dir, self.adjust)
+        fresh = [(c, n) for c, n in targets if not (ddir / f"{c}.parquet").exists()]
+        existing = [(c, n) for c, n in targets if (ddir / f"{c}.parquet").exists()]
+        units = build_source_units(self.adjust)
+
+        def _proc(code, name, unit):
+            return self._update_stock_one(code, name, end, full, fetch_fn=unit.fetch)
+
+        results: dict[str, tuple[str, str]] = {}
+        per_source: dict[str, dict[str, int]] = {}
+
+        def _merge(res, ps):
+            results.update(res)
+            for n, s in ps.items():
+                agg = per_source.setdefault(n, {"ok": 0, "fail": 0})
+                agg["ok"] += s["ok"]
+                agg["fail"] += s["fail"]
+
+        if fresh:  # 新股优先；em/tx 全挂时新股本轮失败（不阻塞存量池）
+            try:
+                res, ps = MultiSourceScheduler(
+                    [u for u in units if not u.needs_old]).run(fresh, _proc, on_progress)
+                _merge(res, ps)
+            except AllSourcesUnavailableError as e:
+                _log(f"警告: 新股池（em/tx）不可用，{len(fresh)} 只新股本轮失败: {e}")
+                for c, _n in fresh:
+                    results[c] = ("failed", f"新股池无可用源: {e}")
+        if existing:
+            res, ps = MultiSourceScheduler(units).run(existing, _proc, on_progress)
+            _merge(res, ps)
+        return results, per_source
+
     def update_stocks(
         self,
         codes=None,
@@ -559,12 +743,17 @@ class Downloader:
         limit: Optional[int] = None,
         on_progress=None,
         lag_retry_delay: float = 180.0,
+        mode: Optional[str] = None,
     ) -> dict:
         """on_progress(done, total): 每完成一只回调一次（供 EOD 看门狗采集心跳）。
 
         lag_retry_delay: 主遍结束后对「源缺数据(stale)」股票的冷却重试秒数
         （默认 180s；0 表示不冷却立即重试）。EOD 起跑早于数据源生成当日 bar 的
         时段，冷却后仅对 stale 批次再跑一遍，同一轮内自愈（2026-10-30 事故）。
+
+        mode: None -> self.mode（CLI/EOD 构造时指定）；auto=探测新源健康则
+        多源分批（同花顺/新浪/搜狐 + em/tx），否则回退串行；serial=强制既有
+        串行链路（--serial）。
         """
         end = _norm_end(end)
         if codes:
@@ -596,64 +785,53 @@ class Downloader:
         if self.adjust == "qfq":
             _log("提示: 前复权数据每次都会整段重新下载（历史随分红重写），建模推荐用后复权(hfq)。")
 
+        m = mode or self.mode
+        if m not in ("auto", "serial"):
+            raise ValueError(f"未知 mode: {m}")
+        batch = self._multisource_ready(m)
+        if batch:
+            _log(f"模式: 多源分批（同花顺锚定换算{'已启用' if self._ths_enabled else '未启用'}）")
+        else:
+            _log("模式: 串行链路 em->tx->baostock"
+                 + ("（serial 模式）" if m == "serial" else "（新源不可用，自动回退）"))
+
         results: dict[str, tuple[str, str]] = {}
+        per_source: dict[str, dict[str, int]] = {}
         t0 = time.time()
         total = len(targets)
-        done = 0
-        pool = ThreadPoolExecutor(max_workers=self.workers)
         try:
-            futs = {
-                pool.submit(self._update_stock_one, c, n, end, full): c
-                for c, n in targets
-            }
-            prog = as_completed(futs)
-            if tqdm is not None:
-                prog = tqdm(prog, total=len(futs), desc="A股日线", unit="只")
-            for fut in prog:
-                code, status, msg = fut.result()
-                results[code] = (status, msg)
-                done += 1
-                if on_progress is not None:
-                    try:
-                        on_progress(done, total)
-                    except Exception:  # noqa: BLE001 心跳回调绝不影响主链路
-                        pass
+            if batch:
+                results, per_source = self._run_batch(targets, end, full, on_progress)
+            else:
+                results = self._run_serial(targets, end, full, on_progress)
         except KeyboardInterrupt:
             _log("用户中断，取消剩余任务……")
-            for f in futs:
-                f.cancel()
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
 
         # 运行内二次重试: 主遍 stale（源缺数据，非网络故障）的股票，其源窗口
         # 空可能是时段性未生成（EOD 15:50 起跑 vs 数据源 bar 生成时差）。
-        # 冷却 lag_retry_delay 秒后仅对该批次再跑一遍；仍 stale 的留在失败
-        # 清单，次日重跑同一命令自动重试。
+        # 冷却 lag_retry_delay 秒后仅对该批次按同一模式再跑一遍；仍 stale 的留在
+        # 失败清单，次日重跑同一命令自动重试。
         stale_codes = [c for c, (s, _m) in results.items() if s == "stale"]
         if stale_codes:
             if lag_retry_delay > 0:
                 _log(f"{len(stale_codes)} 只股票源无新数据（疑似源空窗），"
                      f"冷却 {lag_retry_delay:.0f}s 后二次重试……")
                 time.sleep(lag_retry_delay)
-            pool2 = ThreadPoolExecutor(max_workers=self.workers)
-            futs2 = {pool2.submit(self._update_stock_one, c, "", end, full): c
-                     for c in stale_codes}
-            try:
-                for fut2 in as_completed(futs2):
-                    code, status, msg = fut2.result()
-                    results[code] = (status, msg)
-                    done += 1
-                    if on_progress is not None:
-                        try:
-                            on_progress(done, total + len(stale_codes))
-                        except Exception:  # noqa: BLE001
-                            pass
-            except KeyboardInterrupt:
-                _log("用户中断，取消剩余任务……")
-                for f in futs2:
-                    f.cancel()
-            finally:
-                pool2.shutdown(wait=False, cancel_futures=True)
+            retry = [(c, "") for c in stale_codes]
+            base, all_total = len(results), total + len(stale_codes)
+            prog2 = None
+            if on_progress is not None:
+                prog2 = lambda dn, _t: on_progress(base + dn, all_total)  # noqa: E731
+            if batch:
+                res2, ps2 = self._run_batch(retry, end, full, prog2)
+                results.update(res2)
+                for n, s in ps2.items():
+                    agg = per_source.setdefault(n, {"ok": 0, "fail": 0})
+                    agg["ok"] += s["ok"]
+                    agg["fail"] += s["fail"]
+            else:
+                results.update(self._run_serial(retry, end, full, prog2,
+                                                base_done=base, total=all_total))
 
         # 按最终状态单次计数（二次重试覆盖首遍 stale，避免双计）
         stats = {k: 0 for k in _STAT_LABEL}
@@ -661,6 +839,9 @@ class Downloader:
             stats[status] = stats.get(status, 0) + 1
         failures = [(c, m) for c, (s, m) in results.items() if s in ("failed", "stale")]
         self._report(stats, failures, kind="stocks")
+        if per_source:
+            _log("per-source: " + ", ".join(
+                f"{n}(ok={s['ok']},fail={s['fail']})" for n, s in per_source.items()))
         _log(f"耗时 {time.time() - t0:.0f}s")
         return stats
 
@@ -680,14 +861,22 @@ class Downloader:
                 )
 
     # ------------------------------------------------ 单位断裂修复（repair）
-    def repair_stocks(self, codes=None, force: bool = False, end=None) -> dict:
+    def repair_stocks(self, codes=None, force: bool = False, end=None,
+                      mode: Optional[str] = None) -> dict:
         """修复「单位断裂」股票：全量重拉 [start, end] + 复权单位守卫。
 
         目标 = 待修清单 data/pending_repair_{adjust}.txt ∪ --codes 指定代码。
         - 指定代码无清单记录且无本地数据文件时跳过（防误敲），--force 放行；
         - 成功 -> 合并落盘、移出清单、计 repaired；
         - 失败 -> 登记/保留在清单（次日 EOD 与本命令自动重试）、计 failed。
+
+        mode: None -> self.mode；auto=探测同花顺健康则 THS 锚定全量优先
+        （整文件替换写），否则旧链路；serial=强制旧链路全量重拉（--serial）。
+        清单为空且未指定代码时不探测不触网（EOD 每日空跑 no-op 契约）。
         """
+        m = mode or self.mode
+        if m not in ("auto", "serial"):
+            raise ValueError(f"未知 mode: {m}")
         end = _norm_end(end)
         ddir = store.daily_dir(self.data_dir, self.adjust)
         items = self._pending_repair_load()
@@ -707,10 +896,19 @@ class Downloader:
             if any(stats.values()):
                 self._report(stats, [], kind="repair")
             return stats
+        # 有修复目标才探测（EOD 空清单 no-op 不触网）；serial 恒走旧链路
+        self._ths_enabled = bool(m == "auto" and self.adjust == "hfq"
+                                 and vendors.probe_ths())
+        if self._ths_enabled:
+            _log("修复模式: 优先 THS 锚定全量重拉（探测健康），失败回退旧链路")
+        else:
+            _log("修复模式: 旧链路全量重拉"
+                 + ("（serial 模式）" if m == "serial" else "（THS 不可用或非 hfq）"))
         _log(f"修复 {len(targets)} 只股票（全量重拉 [{self.start}..{end}] + 单位守卫）")
         failures: list[tuple[str, str]] = []
         for code in targets:
-            ok, msg = self._full_refetch_one(code, end)
+            ok, msg = self._full_refetch_one(
+                code, end, _break_date_from_reason(items.get(code, "")))
             if ok:
                 self._pending_repair_remove(code)
                 stats["repaired"] += 1

@@ -6,6 +6,8 @@
     python -m downloader board --with-concept  # 追加概念板块（东财题材/风格标签）
     python -m downloader stocks --codes 600519,000858
     python -m downloader stocks --start 20180101 --adjust qfq
+    python -m downloader stocks --serial          # 强制旧串行链路（默认自动探测多源分批）
+    python -m downloader stocks --source-rate 3   # 同花顺/新浪/搜狐各自限速 3 req/s（默认 2）
     python -m downloader index
     python -m downloader repair --codes 600900.SH   # 修复单位断裂股（默认处理待修清单）
     python -m downloader build              # 合并为单个建模数据集
@@ -15,8 +17,9 @@ from __future__ import annotations
 
 import argparse
 
-from . import config
+from . import config, vendors
 from .app import Downloader, _log
+from .scheduler import AllSourcesUnavailableError
 
 
 def _add_common(p: argparse.ArgumentParser, with_range: bool = False,
@@ -44,6 +47,18 @@ def _add_range_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("--full", action="store_true", help="忽略本地已有日期，从起始日期整段重下")
 
 
+def _add_multisource_opts(p: argparse.ArgumentParser) -> None:
+    """多源分批（2026-11）: 同花顺/新浪/搜狐 + em/tx 批处理池（仅日线类命令）。"""
+    p.add_argument(
+        "--serial", action="store_true",
+        help="强制既有串行链路 em->tx->baostock（默认: 自动探测新源，健康则多源分批）",
+    )
+    p.add_argument(
+        "--source-rate", type=float, default=None,
+        help="同花顺/新浪/搜狐各自独立限速(次/秒；默认: 同花顺 0.66、新浪/搜狐 2)，0=不限速；不影响 em/tx 全局限速",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ashare-dl",
@@ -56,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     _add_common(ps, with_range=True, with_rotate=True)
     _add_range_opts(ps)
+    _add_multisource_opts(ps)
     ps.add_argument("--codes", default=None, help="只下载指定代码，逗号分隔，如 600519,000858")
     ps.add_argument("--market", default="all", choices=["all", "sh", "sz", "bj"], help="限定市场")
     ps.add_argument("--limit", type=int, default=None, help="只处理前 N 只（调试用）")
@@ -95,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--skip-board", action="store_true", help="跳过行业板块成分表刷新")
     _add_common(pa, with_range=True, with_rotate=True)
     _add_range_opts(pa)
+    _add_multisource_opts(pa)
     pa.add_argument("--codes", default=None, help="只下载指定代码，逗号分隔，如 600519,000858")
     pa.add_argument("--market", default="all", choices=["all", "sh", "sz", "bj"], help="限定市场")
     pa.add_argument("--limit", type=int, default=None, help="只处理前 N 只（调试用）")
@@ -106,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common(pr, with_range=True)
     pr.add_argument("--end", default=None, help="结束日期 YYYYMMDD（默认今天）")
+    _add_multisource_opts(pr)
     pr.add_argument("--codes", default=None,
                     help="追加指定修复代码，逗号分隔，如 600900.SH；修复失败留入待修清单")
     pr.add_argument("--force", action="store_true",
@@ -120,8 +138,35 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _dl(args) -> Downloader:
+    # 多源分批（2026-11）: --source-rate 重设三新源独立限速器；--serial 强制串行，
+    # 默认 auto（探测新源健康则分批，全挂自动回退串行链路）。
+    src_rate = getattr(args, "source_rate", None)
+    if src_rate is not None:
+        vendors.configure_source_rate(src_rate)
+    mode = "serial" if getattr(args, "serial", False) else "auto"
     return Downloader(args.data_dir, getattr(args, "adjust", None), getattr(args, "start", None),
-                      args.workers, args.rate, rotate=getattr(args, "rotate", False))
+                      args.workers, args.rate, rotate=getattr(args, "rotate", False),
+                      mode=mode)
+
+
+def _stocks_call(dl: Downloader, args) -> dict:
+    """update_stocks 入口: 全部数据源不可用时非零退出（不静默空跑）。"""
+    try:
+        return dl.update_stocks(
+            codes=args.codes, end=args.end, full=args.full, market=args.market, limit=args.limit
+        )
+    except AllSourcesUnavailableError as e:
+        _log(f"全部数据源不可用，中止: {e}")
+        raise SystemExit(2)
+
+
+def _repair_call(dl: Downloader, args) -> dict:
+    """repair_stocks 入口: 全部数据源不可用时非零退出。"""
+    try:
+        return dl.repair_stocks(codes=args.codes, force=args.force, end=args.end)
+    except AllSourcesUnavailableError as e:
+        _log(f"全部数据源不可用，中止: {e}")
+        raise SystemExit(2)
 
 
 def _proxy_cmd(args) -> None:
@@ -189,13 +234,11 @@ def main(argv=None) -> None:
     elif args.cmd == "board":
         dl.refresh_boards(with_concept=getattr(args, "with_concept", False))
     elif args.cmd == "stocks":
-        dl.update_stocks(
-            codes=args.codes, end=args.end, full=args.full, market=args.market, limit=args.limit
-        )
+        _stocks_call(dl, args)
     elif args.cmd == "index":
         dl.update_indices(indices=args.indices, end=args.end, full=args.full)
     elif args.cmd == "repair":
-        dl.repair_stocks(codes=args.codes, force=args.force, end=args.end)
+        _repair_call(dl, args)
     elif args.cmd == "build":
         dl.build_dataset()
     elif args.cmd == "status":
@@ -210,9 +253,7 @@ def main(argv=None) -> None:
             dl.refresh_trade_calendar()
         except Exception as e:  # noqa: BLE001
             _log(f"交易日历刷新失败: {e}")
-        dl.update_stocks(
-            codes=args.codes, end=args.end, full=args.full, market=args.market, limit=args.limit
-        )
+        _stocks_call(dl, args)
         dl.update_indices(end=args.end, full=args.full)
         if not args.skip_board:
             try:

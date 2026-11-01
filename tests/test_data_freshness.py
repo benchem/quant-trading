@@ -681,13 +681,15 @@ def test_cli_repair_parse():
 
 def test_cli_repair_dispatch(monkeypatch, tmp_path):
     """CLI 端到端: repair 子命令处理待修清单并清空（走真实 cli.main 分派）。"""
-    from downloader import cli
+    from downloader import cli, vendors
     c = "600905.SH"
     full = _broken_local_and_full(tmp_path, c, break_at=None)
     d = _mk_dl(tmp_path)
     d._pending_repair_save({c: "单位断裂"})
     monkeypatch.setattr(source, "fetch_daily",
                         lambda wind_code, start, end, adjust: full.copy())
+    # CLI 默认 mode=auto 会探测同花顺（真实请求）；离线测试固定探测失败走旧链路
+    monkeypatch.setattr(vendors, "probe_ths", lambda: False)
     cli.main(["repair", "--data-dir", str(tmp_path), "--rate", "0", "--end", "20261030"])
     assert not (tmp_path / "pending_repair_hfq.txt").exists()
     after = pd.read_parquet(store.daily_dir(tmp_path, "hfq") / f"{c}.parquet")

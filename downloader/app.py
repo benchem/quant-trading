@@ -65,6 +65,11 @@ def _reject_unit_anomaly(old: Optional[pd.DataFrame], new: pd.DataFrame,
     永久阻塞增量更新）。旧数据不足 6 根不校验（上市初期无涨跌停限制）。
     大比例缩股除权日 hfq 也会出现 >32% 的真实跳变（罕见），被误拦时仅跳过当日更新。
     返回非空原因字符串表示拒绝；空串放行。仅对 hfq/qfq 调用（none 除权跳空正常）。
+
+    历史真实跳变豁免（2026-11-01）：1996-12 涨跌停制度前、股改复牌（2005-2007）、
+    大比例送转除权日的单日 >32% 是真实行情。若【旧序列自身在同一交易日也有
+    >limit 跳变】（新旧两源一致），说明不是混基准而是共同的历史事实 -> 放行；
+    旧序列该日无跳变（如腾讯 raw bar 混入、断裂接缝）则照常拦截。
     """
     if new is None or len(new) == 0 or old is None or len(old) < 6:
         return ""
@@ -77,12 +82,22 @@ def _reject_unit_anomaly(old: Optional[pd.DataFrame], new: pd.DataFrame,
     m = m.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
     c = pd.to_numeric(m["close"], errors="coerce").astype(float)
     ret = c.pct_change().abs()
-    bad = ret.where(m["_new"]) > limit
+    # 旧序列自身的逐日跳变（按交易日对齐），用于历史真实跳变豁免
+    oo = pd.DataFrame({"date": pd.to_datetime(old["date"]),
+                       "close": pd.to_numeric(old["close"], errors="coerce").astype(float)}
+                      ).sort_values("date").reset_index(drop=True)
+    o_ret = oo["close"].pct_change().abs()
+    o_ret.index = oo["date"]
+    bad = (ret.where(m["_new"]) > limit).fillna(False)
     if bad.any():
-        i = int(bad.idxmax())
-        return (f"疑似复权单位断裂: {m['date'].iloc[i].date()} 单日|涨跌|"
-                f"{ret.iloc[i] * 100:.1f}% 超过 {limit * 100:.0f}%"
-                f"（前收 {c.iloc[i - 1]:.3f} -> {c.iloc[i]:.3f}），已保留旧数据")
+        for i in bad[bad].index:
+            d = m["date"].iloc[i]
+            prev = o_ret.get(d)
+            if prev is not None and not pd.isna(prev) and prev > limit:
+                continue  # 新旧两源在该日跳变一致：历史真实行情，豁免
+            return (f"疑似复权单位断裂: {m['date'].iloc[i].date()} 单日|涨跌|"
+                    f"{ret.iloc[i] * 100:.1f}% 超过 {limit * 100:.0f}%"
+                    f"（前收 {c.iloc[i - 1]:.3f} -> {c.iloc[i]:.3f}），已保留旧数据")
     return ""
 
 

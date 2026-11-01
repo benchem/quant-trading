@@ -993,7 +993,8 @@ def test_full_refetch_from_date_keeps_pre_break_history(tmp_path, monkeypatch):
     monkeypatch.setattr(app_mod.vendors, "fetch_ths_hfq", fake_ths)
     ok, msg = d._full_refetch_one(code, "20261030", from_date="20261020")
     assert ok, msg
-    # 拉取窗口与锚定基准都以断裂日为界（不再整段 [20200101..] 重拉重写）
+    # app 层把断裂日透传为拉取起点与 anchor_before；「再前移一根避开脏 bar」
+    # 的窗口逻辑在 vendors.fetch_ths_hfq 内部（见 test_ths_hfq_drops_dirty_prebreak_bar）
     assert seen["start"] == "20261020" and seen["anchor_before"] == "20261020"
     assert seen["full"] is True
     after = store.load_daily(store.daily_dir(tmp_path, "hfq") / f"{code}.parquet")
@@ -1035,3 +1036,57 @@ def test_ths_default_rate_slower():
         assert vendors.ths_limiter.rate == 1.0 and vendors.sina_limiter.rate == 4.0
     finally:
         vendors.configure_source_rate(vendors.DEFAULT_SOURCE_RATE, vendors.THS_SOURCE_RATE)
+
+
+# ============================================================ J. 守卫历史真实跳变豁免
+# （2026-11-01：000525 的 1994-08-01 +45% 是涨跌停制度前真实行情，被 32% 守卫误拦
+#   导致修复永久失败；豁免规则=旧序列同日也有 >limit 跳变（两源一致=历史事实））
+
+def test_reject_unit_anomaly_exempts_historical_real_jump():
+    """两源在同一天有一致的大跳变（1996 涨跌停制度前/股改复牌）-> 放行。"""
+    days = list(pd.bdate_range("1994-07-01", "1994-08-31"))
+    closes = [2.0] * len(days)
+    closes[days.index(pd.Timestamp("1994-08-01"))] = 3.0  # +50% 历史真实
+    old = _mk_df(days, closes)
+    new = _mk_df(days, closes)  # 重拉回同样跳变（两源一致）
+    assert app_mod._reject_unit_anomaly(old, new) == ""
+
+
+def test_reject_unit_anomaly_still_blocks_new_jump():
+    """new 引入、old 没有的跳变（腾讯 raw 混入/断裂接缝）-> 照常拦截。"""
+    days = list(pd.bdate_range("2026-09-01", "2026-10-30"))
+    closes = [10.0] * len(days)
+    old = _mk_df(days, closes)
+    new_closes = list(closes)
+    new_closes[-1] = 15.0  # +50% 假跳变
+    new = _mk_df(days, new_closes)
+    r = app_mod._reject_unit_anomaly(old, new)
+    assert "疑似复权单位断裂" in r and "2026-10-30" in r
+
+
+def test_ths_hfq_drops_dirty_prebreak_bar(monkeypatch):
+    """000525 实测场景：断口前收 bar 脏（腾讯除权日回 raw 价 -26%，压在守卫线下）。
+
+    锚定窗口须跳过断口前一根（否则单根脏 bar 把 CV 撑爆 5.8% 拒锚），
+    替换窗口从脏 bar 起把它一并换掉。
+    """
+    days = list(pd.bdate_range("2026-09-01", "2026-10-30"))
+    n = len(days)
+    ths_closes = [40.0 + 0.1 * i for i in range(n)]
+    r_base = 0.98  # 存量/THS 基准比值
+    di = days.index(pd.Timestamp("2026-10-27"))
+    old_closes = [c * r_base for c in ths_closes]
+    old_closes[di] *= 0.736  # 腾讯 raw 混入: -26.4%（<32% 逃过守卫写入存量）
+    old = _mk_df(days[:di + 1], old_closes[:di + 1])  # 存量停在脏 bar 10-27
+    qfq = _mk_df(days, ths_closes)  # THS 全史（正确基准）
+    monkeypatch.setattr(vendors, "fetch_ths_qfq_full", lambda wc, s, e: qfq.copy())
+    out = vendors.fetch_ths_hfq("000525.SZ", "20261028", "20261030", old,
+                                full=True, anchor_before="20261028")
+    # 锚定末根 = 断裂前 2 根（date<10-28 末根 10-27 去尾 = 10-26），
+    # 替换窗口从 10-27（脏 bar）起把它一并换掉
+    assert out["date"].min() == pd.Timestamp("2026-10-27")
+    row = out[out["date"] == pd.Timestamp("2026-10-27")]
+    assert abs(row["close"].iloc[0] - ths_closes[di] * r_base) < 1e-6  # 回到基准
+    # 修复帧自身接缝平滑（10-26 前收 -> 10-27 新值 <1%）
+    ret = out["close"].pct_change().abs()
+    assert ret.max() < 0.01, ret.tolist()

@@ -31,8 +31,9 @@ import json
 import pandas as pd
 
 from . import source as _source
-from .anchor import (AnchorError, InsufficientOverlapError, compute_anchor_ratio,
-                     compute_tail_ratio, last_date, scale_prices)
+from .anchor import (AnchorError, InsufficientOverlapError, MAX_CV,
+                     compute_anchor_ratio, compute_tail_ratio, last_date,
+                     scale_prices)
 from .errors import FetchError, SourceUnsupportedError
 from .ratelimit import RateLimiter
 from .store import OHLCV_COLUMNS
@@ -380,14 +381,28 @@ def fetch_ths_hfq(wind_code: str, start: str, end: str, old,
     if old is None or len(old) == 0:
         raise AnchorError(f"同花顺锚定需要存量数据（新股 {wind_code} 请走 em/tx）")
     anchor_old = old
+    replace_from = None
     if anchor_before is not None:
         cut = pd.Timestamp(_ymd(anchor_before))
         anchor_old = old[pd.to_datetime(old["date"]) < cut].reset_index(drop=True)
+        # 断口前收 bar（截尾段末根）最可能是脏 bar：腾讯除权日回 raw 价混入 hfq
+        # （2026-11-01 实测 000525：10-27 脏 bar -26.4% 恰好压在 32% 守卫线下、
+        # 次日回正常值反被拦）。锚定与替换窗口都再避开一根：
+        # 锚定用 [.., 断裂日前2根]，替换从「断裂日前一根」起（脏 bar 一并换掉）。
+        if len(anchor_old) > 1:
+            anchor_old = anchor_old.iloc[:-1]
         if len(anchor_old) == 0:
             raise AnchorError(f"锚定窗口（<{anchor_before}）内无存量好 bar（{wind_code}）")
+        replace_from = (last_date(anchor_old)
+                        + pd.Timedelta(days=1)).strftime("%Y%m%d")
     if full:
         fetch_start = _ymd(start)
-        if anchor_before is not None:
+        if replace_from is not None:
+            # 拉取窗口须覆盖锚定段往回一段（≥5 根重叠可算比值）+ 脏 bar 起的替换窗口
+            lo120 = (last_date(anchor_old)
+                     - pd.Timedelta(days=120)).strftime("%Y%m%d")
+            fetch_start = min(fetch_start, lo120, replace_from)
+        elif anchor_before is not None:
             lo120 = (pd.Timestamp(_ymd(anchor_before))
                      - pd.Timedelta(days=120)).strftime("%Y%m%d")
             fetch_start = min(fetch_start, lo120)
@@ -401,9 +416,13 @@ def fetch_ths_hfq(wind_code: str, start: str, end: str, old,
             tail = (last_date(anchor_old) - pd.Timedelta(days=120)).strftime("%Y%m%d")
             lo = min(lo, tail)
             qfq = fetch_ths_qfq_full(wind_code, lo, end)
-    ratio, _overlap = compute_anchor_ratio(anchor_old, qfq)
+    # 修复路径 CV 门放宽到 0.8%：去尾已避开脏 bar，剩余重叠的供应商慢性微漂
+    # （腾讯/THS 复权因子精度差，实测 0.5~0.7%）不是混基准；阶跃型混基准 CV >3%
+    # 依然全拦，且最终还有 app 层 32% 守卫把关接缝。
+    max_cv = 0.008 if anchor_before is not None else MAX_CV
+    ratio, _overlap = compute_anchor_ratio(anchor_old, qfq, max_cv=max_cv)
     out = _synthesize_metrics(scale_prices(qfq, ratio))
-    return _window(out, start, end)
+    return _window(out, replace_from or start, end)
 
 
 def _raw_continuation(fetch_raw, wind_code: str, start: str, end: str,

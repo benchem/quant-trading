@@ -238,7 +238,9 @@ def build_source_units(adjust: str = "hfq") -> list[SourceUnit]:
             return False
 
     def _tx_supports(code: str) -> bool:
-        return not code.split(".")[0].startswith(("688", "689"))
+        # 2026-11-01 实测腾讯已恢复科创板（688/689 逐只抽验 hfqday 到位）；
+        # 早前 501 期间的排除已解除，688 新股在 em 瘫时也可走 tx
+        return True
 
     def _not_bj(code: str) -> bool:
         return not code.endswith(".BJ")

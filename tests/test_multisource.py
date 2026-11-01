@@ -529,11 +529,11 @@ def test_scheduler_circuit_breaker_and_supports():
 
 
 def test_build_source_units_wiring():
-    """单元工厂：五源齐备、探测/支持接线正确（tx 明确不支持科创板 688/689）。"""
+    """单元工厂：五源齐备、探测/支持接线正确（tx 已恢复科创板支持）。"""
     units = {u.name: u for u in build_source_units()}
     assert set(units) == {"em", "tx", "ths", "sina", "sohu"}
-    assert units["tx"].supports("688001.SH") is False
-    assert units["tx"].supports("689009.SH") is False
+    assert units["tx"].supports("688001.SH") is True
+    assert units["tx"].supports("689009.SH") is True
     assert units["tx"].supports("600519.SH") is True
     assert units["sina"].supports("920002.BJ") is False
     assert units["sina"].supports("000001.SZ") is True

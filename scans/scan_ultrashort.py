@@ -146,10 +146,11 @@ def main():
     dfb = dfb[dfb["signal"].notna()]
     remaining("8.结构突破(8a/8b)")
 
-    # 9. 距60日最高收盘 >= 5% 空间（8b 触发者空间为0，自然剔除）
+    # 9. 距60日最高收盘 >= 5% 空间（仅约束 8a：年线收复型需确认上方有肉；
+    #    8b=60日新高收盘，上方天然是空间，免检——v2 修正：原口径与 8b 数学互斥）
     dfb["room60"] = dfb["close60_max"] / dfb["close"] - 1.0
-    dfb = dfb[dfb["room60"] >= 0.05]
-    remaining("9.距60日高点>=5%")
+    dfb = dfb[(dfb["signal"] == "8b") | (dfb["room60"] >= 0.05)]
+    remaining("9.距60日高点>=5%(8a)")
 
     # 10. 近20日累计涨幅（含今日） <= +30%
     dfb["pct20"] = dfb["close"] / dfb["close20_first"] - 1.0

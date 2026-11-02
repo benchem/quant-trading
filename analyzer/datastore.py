@@ -388,6 +388,15 @@ class DataStore:
         full_n = int(n_codes.max()) if len(n_codes) else 0
         m["partial"] = n_codes < full_n * 0.9
         m["nav_eqw"] = (1.0 + m["mean_ret"].fillna(0.0)).cumprod()
+        # 成交额合理性钳制（2026-11-02 事故：日线源全挂降级 sina，其日线无
+        # amount 字段，当日全市场 amount=NaN/残缺，聚合成 8 亿的假「全市场
+        # 成交额」——行数判据的 partial 抓不住这种坏日）。某日 amount_yi 低于
+        # 近 20 个交易日（不含当日）中位数的 30% 时置 NaN（前端显示 —）；
+        # 中位数窗口内全 NaN（数据起步期/全缺日）时不钳制，避免误伤。
+        med = m["amount_yi"].rolling(20, min_periods=1).median().shift(1)
+        bad_amt = (m["amount_yi"].notna() & med.notna() & (med > 0)
+                   & (m["amount_yi"] < med * 0.30))
+        m.loc[bad_amt, "amount_yi"] = float("nan")
         m.index = m.index.normalize()
         m.index.name = "date"
         return m

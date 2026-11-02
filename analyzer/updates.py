@@ -624,6 +624,23 @@ class EodUpdater:
             except Exception as e:  # noqa: BLE001
                 self._error(f"单位断裂修复失败: {e}")
 
+        # 4c. 当日成交额缺失防御（2026-11-02 事故：日线源全挂降级 sina 时，
+        #     其日线 API 无 amount 字段，全市场 amount/turnover=NaN，市场页
+        #     成交额只剩零头）。检测当日覆盖率，坏则用腾讯实时行情回补。
+        if hasattr(dl, "refresh_daily_amounts"):
+            try:
+                dl.refresh_daily_amounts(day)
+                chk = getattr(dl, "last_amount_check", None) or {}
+                cov = chk.get("coverage")
+                cov_s = f"{cov * 100:.1f}%" if cov is not None else "无数据"
+                if chk.get("patched"):
+                    print(f"[eod] 当日成交额覆盖率 {cov_s} -> "
+                          f"已回补 {chk['patched']} 只", flush=True)
+                else:
+                    print(f"[eod] 当日成交额覆盖率 {cov_s} -> 正常", flush=True)
+            except Exception as e:  # noqa: BLE001 回补失败不阻塞主链路
+                self._error(f"当日成交额回补失败: {e}")
+
         # 5. 指数
         self._stage("index")
         try:

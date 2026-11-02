@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import re
 import threading
 import time
@@ -26,6 +27,15 @@ except Exception:  # pragma: no cover
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def _atomic_parquet(path: Path, df: pd.DataFrame) -> None:
+    """parquet 原子落盘：tmp + os.replace（避免读到半个文件）。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_parquet(tmp, index=False, engine="pyarrow")
+    os.replace(tmp, path)
 
 
 def _norm_end(end) -> str:
@@ -318,6 +328,143 @@ class Downloader:
         store.write_quote_date(self.data_dir, quote_date or dt.date.today().isoformat())
         _log(f"行情字段已用腾讯实时行情兜底刷新: {n_updated}/{len(df)} 只 -> {p}")
         return df
+
+    def refresh_daily_amounts(self, day) -> tuple[int, int]:
+        """日线 amount 缺失防御（2026-11-02 事故：东财/腾讯/搜狐/同花顺日线
+        全挂，EOD 降级 sina——其日线 API 只有 OHLCV 无 amount，导致当日
+        全市场日线 amount/turnover=NaN，市场页成交额只剩零头）。
+
+        检测某交易日 amount 覆盖率（当日有 K 线的代码中 amount>0 占比）：
+        对照前一交易日覆盖率，跌幅超 30 个百分点、或绝对值低于 50% 判坏；
+        坏则用腾讯实时行情（fetch_gtimg_quotes，f37 成交额/f38 换手率）
+        批量回补：patch 单股文件 data/daily/{adjust}/{code}.parquet 当日行
+        + dataset/daily_hfq.parquet 对应行（读全表改列写回，原子替换）。
+        停牌（无行情/价 0）不动；幂等：已有值跳过（只补 amount 缺失/为 0 的）。
+
+        返回 (patched, skipped)；检测结果挂 self.last_amount_check 供
+        EOD 编排层打日志（{"day", "coverage", "prev_coverage", "bad",
+        "patched", "skipped"}）。
+        """
+        ts = pd.Timestamp(str(day)[:10]).normalize()
+        merged_p = store.dataset_dir(self.data_dir) / "daily_hfq.parquet"
+
+        def _check(coverage, prev_cov, bad, patched, skipped):
+            self.last_amount_check = {
+                "day": str(ts.date()), "coverage": coverage,
+                "prev_coverage": prev_cov, "bad": bool(bad),
+                "patched": patched, "skipped": skipped,
+            }
+            return (patched, skipped)
+
+        # ---- 当日行：优先合并表（EOD dataset 阶段后）；没有则扫单股目录
+        merged = None
+        if merged_p.exists():
+            try:
+                merged = pd.read_parquet(merged_p, columns=["date", "code", "amount"])
+                merged["date"] = pd.to_datetime(merged["date"]).dt.normalize()
+            except Exception as e:  # noqa: BLE001 合并表损坏按无合并表处理
+                _log(f"警告: daily_hfq 合并表读取失败（按单股目录扫描）: {e}")
+                merged = None
+        rows = None
+        if merged is not None and len(merged):
+            rows = merged[merged["date"] == ts]
+        if rows is None or not len(rows):
+            parts = []
+            for f in sorted(store.daily_dir(self.data_dir, self.adjust).glob("*.parquet")):
+                try:
+                    t = pd.read_parquet(f, columns=["date", "code", "amount"])
+                except Exception:  # noqa: BLE001 单文件损坏跳过
+                    continue
+                t = t[pd.to_datetime(t["date"]).dt.normalize() == ts]
+                if len(t):
+                    parts.append(t)
+            rows = pd.concat(parts, ignore_index=True) if parts else None
+
+        if rows is None or not len(rows):
+            return _check(None, None, False, 0, 0)  # 当日无 K 线（EOD 未拉到）
+
+        n = len(rows)
+        have = rows["amount"].notna() & (rows["amount"] > 0)
+        missing = rows.loc[~have, "code"].tolist()
+        coverage = float(have.sum()) / n
+        if not missing:
+            return _check(coverage, None, False, 0, 0)  # 正常
+
+        # ---- 前一交易日覆盖率（合并表有历史才有；否则只用绝对阈值）
+        prev_cov = None
+        if merged is not None and len(merged):
+            hist = merged.loc[merged["date"] < ts, "date"]
+            if len(hist):
+                prev = merged[merged["date"] == hist.max()]
+                if len(prev):
+                    ph = prev["amount"].notna() & (prev["amount"] > 0)
+                    prev_cov = float(ph.sum()) / len(prev)
+        bad = coverage < 0.5 or (prev_cov is not None and prev_cov - coverage > 0.30)
+        if not bad:
+            # 覆盖率正常（个别停牌/无额度的缺失不视为事故）
+            return _check(coverage, prev_cov, False, 0, len(missing))
+
+        # ---- 腾讯实时行情批量回补
+        try:
+            quotes = source.fetch_gtimg_quotes(missing)
+        except Exception as e:  # noqa: BLE001 兜底源也失败：记状态返回
+            _log(f"警告: 当日成交额回补失败（腾讯行情）: {e}")
+            quotes = {}
+        patches = {}
+        skipped = 0
+        for code in missing:
+            q = quotes.get(code) or {}
+            amt = q.get("amount")
+            if not amt or amt <= 0:
+                skipped += 1  # 停牌/无行情/无额度：不动
+                continue
+            patches[code] = q
+
+        # 单股文件：读全表改当日行，原子写回；只动 amount/turnover
+        ddir = store.daily_dir(self.data_dir, self.adjust)
+        written = 0
+        for code, q in patches.items():
+            f = ddir / f"{code}.parquet"
+            try:
+                df = pd.read_parquet(f, engine="pyarrow")
+            except Exception as e:  # noqa: BLE001 单股失败跳过（其余照补）
+                _log(f"警告: {code} 日线读取失败，跳过回补: {e}")
+                skipped += 1
+                continue
+            mask = pd.to_datetime(df["date"]).dt.normalize() == ts
+            if not mask.any():
+                skipped += 1
+                continue
+            df.loc[mask, "amount"] = float(q["amount"])
+            if q.get("turnover") is not None and "turnover" in df.columns:
+                df.loc[mask, "turnover"] = float(q["turnover"])
+            _atomic_parquet(f, df)
+            written += 1
+
+        # 合并表：仅当其本身含当日行时同步 patch（否则等 build_dataset 重建）
+        if merged is not None and len(merged) and (merged["date"] == ts).any():
+            try:
+                full = pd.read_parquet(merged_p, engine="pyarrow")
+                m = (pd.to_datetime(full["date"]).dt.normalize() == ts) \
+                    & full["code"].isin(set(patches))
+                amt_map = {c: float(q["amount"]) for c, q in patches.items()}
+                full.loc[m, "amount"] = full.loc[m, "code"].map(amt_map).astype(float)
+                if "turnover" in full.columns:
+                    tov_map = {c: (float(q["turnover"])
+                                   if q.get("turnover") is not None else float("nan"))
+                               for c, q in patches.items()}
+                    tov = full.loc[m, "code"].map(tov_map).astype(float)
+                    # 腾讯给了换手才写（当日权威值）；不得把已有值抹成 NaN
+                    tov_m = tov.notna()
+                    full.loc[m, "turnover"] = full.loc[m, "turnover"].where(~tov_m, tov)
+                _atomic_parquet(merged_p, full)
+            except Exception as e:  # noqa: BLE001 合并表失败不影响单股文件
+                _log(f"警告: daily_hfq 合并表成交额回补失败: {e}")
+        skipped += len(patches) - written
+        _log(f"当日成交额覆盖率 {coverage * 100:.1f}%（前一日 "
+             f"{f'{prev_cov * 100:.1f}%' if prev_cov is not None else '无数据'}）"
+             f"-> 腾讯行情回补 {written} 只，{skipped} 只停牌/无行情未动")
+        return _check(coverage, prev_cov, True, written, skipped)
 
     def _stock_list(self) -> pd.DataFrame:
         p = store.stock_list_path(self.data_dir)

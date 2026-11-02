@@ -277,9 +277,12 @@ def fetch_gtimg_quotes(wind_codes) -> dict[str, dict]:
     """腾讯实时行情批量（GBK）：{wind_code: 行情字段}。
 
     响应形如 ``v_sz300687="51~名称~代码~现价~昨收~..."``（~ 分隔）：
-    3=现价、4=昨收、38=换手率、44=流通市值(亿)、45=总市值(亿)。
+    3=现价、4=昨收、37=成交额(万元)、38=换手率、44=流通市值(亿)、45=总市值(亿)。
     市值 ×1e8 存元（与 stock_list/stock_basic 单位一致，
-    对照 300687 total_mv=9.724e9=97.24 亿）。停牌/缺字段的代码不返回，
+    对照 300687 total_mv=9.724e9=97.24 亿）。成交额 ×1e4 存元（300687
+    f37=64668 万 = 646679903.28 元，与分钟线推导一致），供日线 amount
+    缺失回补（2026-11-02 事故：sina 兜底日线源无 amount 字段）。
+    停牌/缺字段的代码不返回，
     由调用方保留旧值。全部批次无任何有效行情时 raise FetchError
     （兜底源也失败的判定依据：调用方不得 bump sidecar）。
     """
@@ -309,10 +312,12 @@ def fetch_gtimg_quotes(wind_codes) -> dict[str, dict]:
             price, pre_close = fl(3), fl(4)
             if price is None or price <= 0:
                 continue  # 停牌/无行情：不返回，调用方保留旧值
+            amt_wan = fl(37)  # 成交额（万元）
             out[code] = {
                 "latest_price": price,
                 "pct_chg": ((price / pre_close - 1) * 100
                             if pre_close else None),
+                "amount": (amt_wan * 1e4) if amt_wan is not None else None,
                 "turnover": fl(38),
                 "float_mv": (fl(44) * 1e8) if fl(44) is not None else None,
                 "total_mv": (fl(45) * 1e8) if fl(45) is not None else None,
@@ -733,6 +738,10 @@ try:  # py3.10: concurrent.futures.TimeoutError 不是内建 TimeoutError
     from concurrent.futures import TimeoutError as _PoolTimeoutError
 except ImportError:  # pragma: no cover
     _PoolTimeoutError = TimeoutError
+try:  # BrokenProcessPool 只在 concurrent.futures.process（except 分支要用）
+    from concurrent.futures.process import BrokenProcessPool
+except ImportError:  # pragma: no cover
+    BrokenProcessPool = type("_NeverRaised", (Exception,), {})
 
 
 def _bs_apply_socket_timeout() -> None:

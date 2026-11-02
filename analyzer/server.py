@@ -20,6 +20,9 @@ from .notify import NotificationHub
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
+# /api/backtest/run 结果内存缓存：(strategy, days, topn) -> (ts, payload)
+_backtest_cache: dict = {}
+
 
 def _static_cache_control(rel: str) -> str:
     """静态资源缓存策略（无内容哈希文件名，靠 ETag 协商保正确性）：
@@ -602,6 +605,34 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                     if brief_pusher is None:
                         return self._json({"error": "美股简报推送未启用"}, 503)
                     self._json(brief_pusher.get_status())
+                elif path == "/api/backtest/run":
+                    # 模拟交易回测：T-1 选股 → T 日验证（结果 10 分钟内存缓存）
+                    from . import backtest as backtest_mod
+
+                    try:
+                        days = int(params.get("days", 20))
+                    except ValueError:
+                        return self._json({"error": "days 应为整数"}, 400)
+                    try:
+                        topn = int(params.get("topn", 10))
+                    except ValueError:
+                        return self._json({"error": "topn 应为整数"}, 400)
+                    days = max(5, min(days, 60))      # clamp 5~60
+                    topn = max(1, min(topn, 30))      # clamp 1~30
+                    strategy = params.get("strategy") or "ultrashort"
+                    if strategy not in backtest_mod.STRATEGIES:
+                        return self._json(
+                            {"error": f"未知策略 {strategy}（可选: "
+                                      f"{', '.join(backtest_mod.STRATEGIES)}）"}, 400)
+                    key = (strategy, days, topn)
+                    hit = _backtest_cache.get(key)
+                    if hit is not None and time.time() - hit[0] < 600:
+                        return self._json(hit[1])
+                    out = backtest_mod.run_backtest(
+                        days=days, topn=topn, data_dir=store.root,
+                        strategy=strategy)
+                    _backtest_cache[key] = (time.time(), out)
+                    self._json(out)
                 elif path == "/api/notifications":
                     nb = self._inbox(user)
                     if nb is None:
@@ -1161,6 +1192,11 @@ def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765,
                     store_ref.reload()
                     if runner_ref is not None:
                         runner_ref.clear_cache()
+                    # 模拟交易回测的懒加载数据与结果缓存一并失效
+                    from . import backtest as _bt
+
+                    _bt._cache.clear()
+                    _backtest_cache.clear()
                     prev = cur2
                     print(f"[watch] 检测到数据文件更新，已重载 ({time.strftime('%H:%M:%S')})")
                 except Exception as e:  # noqa: BLE001
@@ -1196,7 +1232,7 @@ def serve(data_dir: str = "data", host: str = "127.0.0.1", port: int = 8765,
     print(f"数据加载完成: {store.meta['n_stocks']} 只股票 | "
           f"{store.meta['date_min']} ~ {store.meta['date_max']} | "
           f"耗时 {store.meta['load_seconds']}s")
-    print(f"股票分析仪表盘: {url}   (Ctrl+C 退出)")
+    print(f"量化交易分析: {url}   (Ctrl+C 退出)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

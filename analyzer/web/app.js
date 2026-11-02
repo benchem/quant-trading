@@ -1,4 +1,4 @@
-/* A股数据分析仪表盘 —— 前端逻辑（原生 JS + ECharts） */
+/* 量化交易分析 —— 前端逻辑（原生 JS + ECharts） */
 "use strict";
 
 const $ = (s) => document.querySelector(s);
@@ -3649,6 +3649,159 @@ function bindJournal() {
   });
 }
 
+/* ============================== 模拟交易（T-1 选股 → T 日验证） ============================== */
+
+const SIM = { data: null, expanded: new Set(), running: false };
+
+async function runSimtrade() {
+  if (SIM.running) return;
+  const days = Math.max(5, Math.min(60, parseInt($("#sim-days").value, 10) || 20));
+  const topn = Math.max(1, Math.min(30, parseInt($("#sim-topn").value, 10) || 10));
+  const strategy = $("#sim-strategy").value || "ultrashort";
+  $("#sim-days").value = days;
+  $("#sim-topn").value = topn;
+  SIM.running = true;
+  $("#sim-run").disabled = true;
+  $("#sim-status").textContent = "回测中…（首次运行需加载全市场数据，约 15~30 秒）";
+  try {
+    const out = await api(`/api/backtest/run?strategy=${encodeURIComponent(strategy)}&days=${days}&topn=${topn}`);
+    SIM.data = out;
+    SIM.expanded.clear();
+    renderSim(out);
+    $("#sim-status").textContent = "";
+  } catch (err) {
+    $("#sim-status").textContent = "";
+    toast(err.message);
+  } finally {
+    SIM.running = false;
+    $("#sim-run").disabled = false;
+  }
+}
+
+function renderSim(out) {
+  ["#sim-cards", "#sim-chart-box", "#sim-signal-box", "#sim-daily-box"].forEach((s) => {
+    $(s).style.display = "";
+  });
+  renderSimCards(out);
+  renderSimChart(out);
+  renderSimLatest(out.latest_signal);
+  renderSimDaily(out);
+}
+
+function simExitTxt(t) {
+  if (t === "tp") return "止盈 +6%";
+  if (t === "stop") return "止损 -4%";
+  if (t === "close") return "收盘卖出";
+  if (t === "untradeable_suspended") return "停牌";
+  if (t === "untradeable_limit") return "一字板";
+  return "—";
+}
+
+function renderSimCards(out) {
+  const cell = (k, v, cls) => `<div class="card"><div class="k">${k}</div>
+    <div class="v ${cls || ""}">${v}</div></div>`;
+  const best = out.best ? `${escHtml(best.name)} ${fmtPct(best.ret)}` : "—";
+  const worst = out.worst ? `${escHtml(worst.name)} ${fmtPct(worst.ret)}` : "—";
+  $("#sim-cards").innerHTML =
+    cell("样本数（pick×日）", `${out.total_picks}<span class="s">可成交 ${out.tradeable}</span>`) +
+    cell("胜率", out.win_rate == null ? "—" : fmtPct(out.win_rate, 1), pctCls((out.win_rate || 0) - 0.5)) +
+    cell("平均次日收益", out.avg_ret == null ? "—" : fmtPct(out.avg_ret), pctCls(out.avg_ret)) +
+    cell("T 日收涨占比", out.t_up_rate == null ? "—" : fmtPct(out.t_up_rate, 1)) +
+    cell("止盈触发率", out.tp_rate == null ? "—" : fmtPct(out.tp_rate, 1)) +
+    cell("止损触发率", out.stop_rate == null ? "—" : fmtPct(out.stop_rate, 1)) +
+    cell("无法成交", `停牌 ${out.untradeable.suspended} · 一字 ${out.untradeable.limit}`) +
+    cell("最佳", best, "up") +
+    cell("最差", worst, "down");
+}
+
+function renderSimChart(out) {
+  const c = mkChart("chart-sim");
+  const days = out.daily.map((d) => d.t_date);
+  const vals = out.daily.map((d) => (d.avg_ret == null ? 0 : +(d.avg_ret * 100).toFixed(2)));
+  c.setOption({
+    tooltip: { ...TOOLTIP, trigger: "axis",
+      formatter: (ps) => {
+        const d = out.daily[ps[0].dataIndex];
+        return `<b>${d.t_date}</b>（信号 ${d.signal_date}）<br>` +
+          `平均收益 ${d.avg_ret == null ? "—" : fmtPct(d.avg_ret)} · ` +
+          `picks ${d.n_picks} · 可成交 ${d.tradeable}` +
+          (d.win_rate != null ? ` · 胜率 ${fmtPct(d.win_rate, 1)}` : "");
+      } },
+    grid: { left: 56, right: 18, top: 24, bottom: 60 },
+    xAxis: { type: "category", data: days, ...AXIS },
+    yAxis: { type: "value", ...AXIS, axisLabel: { ...AXIS.axisLabel, formatter: "{value}%" } },
+    dataZoom: [{ type: "inside" }, { type: "slider", height: 16, bottom: 12, borderColor: "#2a3342", backgroundColor: "#161b24", fillerColor: "rgba(79,142,247,.2)", textStyle: { color: "#8b98ab" } }],
+    series: [{
+      name: "平均次日收益", type: "bar", data: vals,
+      itemStyle: { color: (p) => (vals[p.dataIndex] >= 0 ? UP : DOWN) },
+      label: { show: true, position: "top", color: "#8b98ab", fontSize: 10,
+        formatter: (p) => (out.daily[p.dataIndex].avg_ret == null ? "无picks" : vals[p.dataIndex] + "%") },
+    }],
+  });
+}
+
+function simPickRow(p, showT) {
+  const ret = p.ret;
+  return `<tr>
+    <td class="num">${escHtml(p.code)}</td>
+    <td>${escHtml(p.name)}</td>
+    <td class="num ${pctCls(p.pct)}">${fmtPct(p.pct)}</td>
+    <td class="num">${p.vol_ratio == null ? "—" : p.vol_ratio.toFixed(2)}</td>
+    <td class="num">${p.signal_type}</td>
+    ${showT ? `<td class="num">${p.t_open == null ? "—" : p.t_open.toFixed(2)} → ${p.t_close == null ? "—" : p.t_close.toFixed(2)}</td>
+    <td class="num ${pctCls(ret)}">${ret == null ? simExitTxt(p.exit_type) : fmtPct(ret)}</td>
+    <td>${simExitTxt(p.exit_type)}</td>` :
+    `<td class="num">${p.close_pos == null ? "—" : p.close_pos.toFixed(2)}</td>
+    <td class="num">${p.float_mv_yi == null ? "—" : p.float_mv_yi.toFixed(1)}</td>
+    <td class="num">${p.amount_yi == null ? "—" : p.amount_yi.toFixed(2)}</td>
+    <td class="num">${p.score == null ? "—" : p.score.toFixed(4)}</td>`}
+  </tr>`;
+}
+
+function renderSimLatest(ls) {
+  if (!ls || !ls.picks.length) { $("#sim-signal-box").style.display = "none"; return; }
+  $("#sim-latest-date").textContent = ls.signal_date;
+  $("#sim-latest-table").querySelector("tbody").innerHTML =
+    ls.picks.map((p) => simPickRow(p, false)).join("");
+}
+
+function renderSimDaily(out) {
+  const tb = $("#sim-daily-table").querySelector("tbody");
+  tb.innerHTML = out.daily.map((d, i) => {
+    const open = SIM.expanded.has(i);
+    const rets = d.picks.map((p) => p.ret).filter((r) => r != null);
+    const mx = rets.length ? Math.max(...rets) : null;
+    const mn = rets.length ? Math.min(...rets) : null;
+    return `<tr class="sim-day-row" data-i="${i}">
+      <td class="sim-caret">${open ? "▾" : "▸"}</td>
+      <td>${d.signal_date}</td>
+      <td>${d.t_date}</td>
+      <td class="num">${d.n_picks}</td>
+      <td class="num">${d.tradeable}</td>
+      <td class="num">${d.win_rate == null ? "—" : fmtPct(d.win_rate, 1)}</td>
+      <td class="num ${pctCls(d.avg_ret)}">${d.avg_ret == null ? "—" : fmtPct(d.avg_ret)}</td>
+      <td class="num ${pctCls(mx)}">${mx == null ? "—" : fmtPct(mx)}</td>
+      <td class="num ${pctCls(mn)}">${mn == null ? "—" : fmtPct(mn)}</td>
+    </tr>` +
+    (open ? `<tr class="sim-detail-row"><td colspan="9"><div class="table-wrap">
+      <table class="rank-table"><thead><tr>
+        <th>代码</th><th>名称</th><th class="num">信号日涨幅</th><th class="num">量比</th>
+        <th>突破类型</th><th class="num">T 日 开→收</th><th class="num">收益率</th><th>退出</th>
+      </tr></thead><tbody>${d.picks.map((p) => simPickRow(p, true)).join("")}</tbody></table>
+    </div></td></tr>` : "");
+  }).join("");
+  tb.querySelectorAll(".sim-day-row").forEach((tr) =>
+    tr.addEventListener("click", () => {
+      const i = parseInt(tr.dataset.i, 10);
+      if (SIM.expanded.has(i)) SIM.expanded.delete(i); else SIM.expanded.add(i);
+      renderSimDaily(SIM.data);
+    }));
+}
+
+function bindSimtrade() {
+  $("#sim-run").addEventListener("click", runSimtrade);
+}
+
 /* ============================== 框架 ============================== */
 
 function switchTab(name, opts = {}) {
@@ -4064,6 +4217,7 @@ async function bootstrap() {
 
   bindTabs();
   bindSubTabs();
+  bindSimtrade();
   bindMinuteModal();
   renderChips();
   bindSearch();

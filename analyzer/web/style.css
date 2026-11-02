@@ -597,3 +597,10 @@ footer {
   border-radius: 8px; color: var(--text); padding: 6px 10px; font-size: 12.5px; }
 a.j-code { color: var(--accent); text-decoration: none; cursor: pointer; }
 a.j-code:hover { text-decoration: underline; }
+
+/* ===== 模拟交易（T-1 选股 → T 日验证） ===== */
+.sim-day-row { cursor: pointer; }
+.sim-day-row:hover { background: rgba(79, 142, 247, .07); }
+.sim-caret { color: var(--text-dim); width: 22px; text-align: center; }
+.sim-detail-row > td { padding: 0 8px 8px 26px; background: rgba(22, 27, 36, .5); }
+.sim-detail-row .table-wrap { max-height: 300px; margin: 8px 0 0; }

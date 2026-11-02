@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>A股数据分析仪表盘</title>
+<title>量化交易分析</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <header>
-  <div class="brand">📈 A股数据分析仪表盘</div>
+  <div class="brand">📈 量化交易分析</div>
   <div class="meta" id="meta-line">加载中…</div>
   <span class="header-spacer"></span>
   <button class="hdr-btn" id="update-chip" title="每日交易日 15:30（CST）自动盘后更新：自选股数据优先刷新，再走全市场。点击可立即手动触发一轮更新">
@@ -26,6 +26,7 @@
 <nav class="tabs">
   <button class="tab active" data-tab="market">市场</button>
   <button class="tab" data-tab="stock">个股分析</button>
+  <button class="tab" data-tab="simtrade">模拟交易</button>
   <button class="tab" data-tab="trades">交易记录</button>
   <button class="tab" data-tab="journal">交易日记</button>
   <button class="tab" data-tab="inbox">站内信<span class="tab-badge" id="inbox-tab-badge" style="display:none">0</span></button>
@@ -484,6 +485,76 @@
     </div>
   </section>
 
+  <!-- ===================== 模拟交易（T-1 选股 → T 日验证） ===================== -->
+  <section id="tab-simtrade" class="panel">
+    <div class="toolbar">
+      <span class="toolbar-label">策略</span>
+      <select id="sim-strategy" class="select" title="选股策略（v1 仅超短动量）">
+        <option value="ultrashort">超短动量</option>
+      </select>
+      <span class="toolbar-label">回看交易日</span>
+      <input type="number" id="sim-days" min="5" max="60" value="20" style="width:70px"
+             title="最近 N 个交易日作为验证日 T（clamp 5~60）">
+      <span class="toolbar-label">每日 TopN</span>
+      <input type="number" id="sim-topn" min="1" max="30" value="10" style="width:60px"
+             title="每日按综合分取前 N 只（clamp 1~30）">
+      <button id="sim-run" class="mini-btn">▶ 运行回测</button>
+      <span class="hint" id="sim-status" style="margin:0"></span>
+    </div>
+
+    <div class="cards" id="sim-cards" style="display:none"></div>
+
+    <div class="chart-box" id="sim-chart-box" style="display:none">
+      <div class="chart-title">每个 T 日的平均次日收益%（T 日开盘买入，止损 -4% / 止盈 +6% / 收盘卖出）</div>
+      <div class="chart" id="chart-sim"></div>
+    </div>
+
+    <div class="chart-box" id="sim-signal-box" style="display:none">
+      <div class="chart-title">最新信号（<span id="sim-latest-date"></span> 收盘后选股，次一交易日待验证，不计入上方统计）</div>
+      <div class="table-wrap">
+        <table class="rank-table" id="sim-latest-table">
+          <thead>
+            <tr>
+              <th>代码</th><th>名称</th>
+              <th class="num">信号日涨幅</th>
+              <th class="num">量比</th>
+              <th class="num">收盘位置</th>
+              <th class="num">近20日涨幅</th>
+              <th class="num">流通市值(亿)</th>
+              <th class="num">成交额(亿,估)</th>
+              <th>突破类型</th>
+              <th class="num">综合分</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="chart-box" id="sim-daily-box" style="display:none">
+      <div class="chart-title">逐日明细（D-1 信号日 | T 日验证 · 点击行展开当日 picks）</div>
+      <div class="table-wrap" style="max-height:520px">
+        <table class="rank-table" id="sim-daily-table">
+          <thead>
+            <tr>
+              <th></th>
+              <th>D-1 信号日</th>
+              <th>T 日</th>
+              <th class="num">picks</th>
+              <th class="num">可成交</th>
+              <th class="num">当日胜率</th>
+              <th class="num">平均收益</th>
+              <th class="num">最佳</th>
+              <th class="num">最差</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="hint">退出规则（保守）：T 日最低价触及买价×0.96 记止损；否则最高价触及买价×1.06 记止盈；两者同日触发先记止损；否则收盘卖出。停牌/一字板无法成交，不计入胜率。</div>
+    </div>
+  </section>
+
   <!-- ===================== 交易记录（自选股买卖台账 CRUD） ===================== -->
   <section id="tab-trades" class="panel">
     <div class="toolbar">
@@ -710,7 +781,7 @@
 <div class="auth-overlay" id="auth-overlay" style="display:none">
   <div class="auth-mask"></div>
   <div class="auth-card">
-    <div class="auth-title">📈 A股数据分析仪表盘</div>
+    <div class="auth-title">📈 量化交易分析</div>
     <div class="auth-sub">登录后使用 —— 每位用户的自选股、交易记录与站内信相互隔离</div>
     <div class="btn-group auth-tabs" id="auth-tabs">
       <button data-mode="login" class="active">登录</button>

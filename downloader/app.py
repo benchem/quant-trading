@@ -272,7 +272,51 @@ class Downloader:
             store.save_parquet(store.dataset_dir(self.data_dir) / "stock_basic.parquet", df)
         except Exception as e:  # noqa: BLE001 副本失败不影响主列表
             _log(f"警告: dataset/stock_basic 副本写入失败: {e}")
+        # 行情 vintage 真值源：成功拉到新行情才写当天（2026-11-02 事故：
+        # 行情源失败时 EOD 仍重写副本带新 mtime，mtime 推断的快照日被污染）
+        try:
+            store.write_quote_date(self.data_dir, dt.date.today().isoformat())
+        except Exception as e:  # noqa: BLE001 sidecar 失败不影响主链路
+            _log(f"警告: quote_asof sidecar 写入失败: {e}")
         _log(f"股票列表已刷新: {len(df)} 只 -> {store.stock_list_path(self.data_dir)}")
+        return df
+
+    def refresh_quote_fields(self, quote_date: Optional[str] = None) -> pd.DataFrame:
+        """行情兜底源：腾讯 qt.gtimg 批量行情刷新 stock_list 现有代码的行情字段。
+
+        2026-11-02 事故：东财 clist 全天被封（IP 级黑名单），EOD list 阶段失败，
+        全站行情字段停留在旧收盘价。此时用腾讯实时行情对**本地列表的全部
+        现有代码**刷新 latest_price/pct_chg/turnover/total_mv/float_mv：
+        - 列表代码集不动（不是换列表源，_stock_list_guard 不参与此路径）；
+        - 停牌/无返回/现价 0：保留旧值不覆盖；
+        - 双写 stock_list + dataset/stock_basic 副本（服务端 [watch] 重载器
+           监控的是 stock_basic），并写 sidecar quote_asof.json；
+        - 腾讯也全部失败 -> raise（调用方不 bump sidecar，旧 quote_date 保留）。
+        quote_date 显式传入（测试用）；默认当天。
+        """
+        p = store.stock_list_path(self.data_dir)
+        if not p.exists():
+            raise FetchError("本地无 stock_list，无行情字段可刷（需先完成列表拉取）")
+        df = pd.read_parquet(p, engine="pyarrow")
+        quotes = source.fetch_gtimg_quotes(df["code"].tolist())
+        fields = ("latest_price", "pct_chg", "turnover", "total_mv", "float_mv")
+        n_updated = 0
+        for idx, code in df["code"].items():
+            q = quotes.get(code)
+            # 停牌/无返回/现价 0 -> fetch 层已过滤；这里再防御 price<=0
+            if not q or not q.get("latest_price") or q["latest_price"] <= 0:
+                continue
+            for fld in fields:
+                if fld in df.columns and q.get(fld) is not None:
+                    df.at[idx, fld] = q[fld]
+            n_updated += 1
+        store.save_parquet(p, df)
+        try:
+            store.save_parquet(store.dataset_dir(self.data_dir) / "stock_basic.parquet", df)
+        except Exception as e:  # noqa: BLE001 副本失败不影响主列表
+            _log(f"警告: dataset/stock_basic 副本写入失败: {e}")
+        store.write_quote_date(self.data_dir, quote_date or dt.date.today().isoformat())
+        _log(f"行情字段已用腾讯实时行情兜底刷新: {n_updated}/{len(df)} 只 -> {p}")
         return df
 
     def _stock_list(self) -> pd.DataFrame:

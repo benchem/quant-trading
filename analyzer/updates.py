@@ -399,6 +399,13 @@ class EodUpdater:
             print(f"[eod] 盘中股票列表已刷新（{now.strftime('%H:%M')}）", flush=True)
         except Exception as e:  # noqa: BLE001 静默降级：下个周期自动重试
             print(f"[eod] 盘中股票列表刷新失败（稍后重试）: {e}", flush=True)
+            # 行情兜底（2026-11-02 事故）：列表源挂了也要让行情字段跟上，
+            # 否则全站取价停在旧收盘。兜底也失败时 sidecar 不 bump。
+            try:
+                dl.refresh_quote_fields()
+                print("[eod] 盘中行情已用腾讯实时行情兜底刷新", flush=True)
+            except Exception as e2:  # noqa: BLE001 兜底失败同样静默重试
+                print(f"[eod] 盘中行情兜底刷新失败（稍后重试）: {e2}", flush=True)
 
     def _beat(self) -> None:
         """心跳打点（阶段推进 / 单股完成）。"""
@@ -564,6 +571,16 @@ class EodUpdater:
             dl.refresh_stock_list()
         except Exception as e:  # noqa: BLE001
             self._error(f"股票列表刷新失败: {e}")
+            # 行情兜底（2026-11-02 事故）：东财 clist 被封时 EOD list 阶段失败，
+            # 但后续 build_dataset 仍会用旧 stock_list 重写 dataset/stock_basic
+            # 副本（mtime=今天、内容=旧价）——不补行情，全站取价停在旧收盘。
+            # 腾讯兜底刷新行情字段 + 写 sidecar；兜底也失败时 sidecar 不 bump，
+            # 读取端 quote_date 保留旧值，陈旧快照不会被当最新。
+            try:
+                dl.refresh_quote_fields()
+                self._merge_stats({"quote_fallback": 1})
+            except Exception as e2:  # noqa: BLE001 兜底失败记入状态，主链路继续
+                self._error(f"行情兜底刷新失败（腾讯实时行情）: {e2}")
         try:
             dl.refresh_trade_calendar()
         except Exception as e:  # noqa: BLE001

@@ -258,6 +258,70 @@ def set_heartbeat(fn) -> None:
     _client.heartbeat = fn
 
 
+# ============================================================ 腾讯实时行情（兜底）
+# 行情快照兜底源（2026-11-02 事故）：东财 clist 全天被封时，用 qt.gtimg.cn
+# 批量实时行情刷新 stock_list 现有代码的行情字段（latest_price/pct_chg/
+# turnover/市值）。与「换列表源」无关——列表代码集不动，_stock_list_guard
+# 不参与此路径（守卫拒收腾讯列表是因为其缺 688/689 家族）。
+_GTIMG_QUOTE_URL = "https://qt.gtimg.cn/q="
+_GTIMG_QUOTE_BATCH = 60  # 单请求代码数上限
+_GTIMG_MKT = {"SH": "sh", "SZ": "sz", "BJ": "bj"}
+
+
+def _gtimg_symbol(wind_code: str) -> str:
+    num, mkt = wind_code.split(".")
+    return _GTIMG_MKT.get(mkt.upper(), "sz") + num
+
+
+def fetch_gtimg_quotes(wind_codes) -> dict[str, dict]:
+    """腾讯实时行情批量（GBK）：{wind_code: 行情字段}。
+
+    响应形如 ``v_sz300687="51~名称~代码~现价~昨收~..."``（~ 分隔）：
+    3=现价、4=昨收、38=换手率、44=流通市值(亿)、45=总市值(亿)。
+    市值 ×1e8 存元（与 stock_list/stock_basic 单位一致，
+    对照 300687 total_mv=9.724e9=97.24 亿）。停牌/缺字段的代码不返回，
+    由调用方保留旧值。全部批次无任何有效行情时 raise FetchError
+    （兜底源也失败的判定依据：调用方不得 bump sidecar）。
+    """
+    codes = [c for c in dict.fromkeys(wind_codes) if c]
+    out: dict[str, dict] = {}
+    for i in range(0, len(codes), _GTIMG_QUOTE_BATCH):
+        batch = codes[i:i + _GTIMG_QUOTE_BATCH]
+        sym2code = {_gtimg_symbol(c): c for c in batch}
+        raw = _client.get(_GTIMG_QUOTE_URL, {"q": ",".join(sym2code)}).decode("gbk", "ignore")
+        for seg in raw.split(";"):
+            if "=" not in seg or "~" not in seg:
+                continue
+            var, val = seg.split("=", 1)
+            sym = var.split("_")[-1].strip()
+            code = sym2code.get(sym)
+            if code is None:
+                continue
+            f = val.strip().strip('"').split("~")
+
+            def fl(idx: int):
+                try:
+                    v = float(f[idx])
+                    return v if v == v else None  # NaN -> None
+                except (IndexError, ValueError):
+                    return None
+
+            price, pre_close = fl(3), fl(4)
+            if price is None or price <= 0:
+                continue  # 停牌/无行情：不返回，调用方保留旧值
+            out[code] = {
+                "latest_price": price,
+                "pct_chg": ((price / pre_close - 1) * 100
+                            if pre_close else None),
+                "turnover": fl(38),
+                "float_mv": (fl(44) * 1e8) if fl(44) is not None else None,
+                "total_mv": (fl(45) * 1e8) if fl(45) is not None else None,
+            }
+    if not out:
+        raise FetchError(f"腾讯实时行情全部无有效数据 ({len(codes)} 只)")
+    return out
+
+
 # ============================================================ 通用工具
 def _d(s: str) -> dt.date:
     return dt.date(int(s[:4]), int(s[4:6]), int(s[6:8]))

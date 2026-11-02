@@ -1,6 +1,8 @@
 """本地 Parquet 存储：路径规划、读写、增量合并。"""
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -45,6 +47,40 @@ def trade_cal_path(data_dir) -> Path:
 
 def board_members_path(data_dir) -> Path:
     return Path(data_dir) / "board_members.parquet"
+
+
+def quote_asof_path(data_dir) -> Path:
+    """行情快照所属交易日的 sidecar（真值源）。
+
+    2026-11-02 事故：行情源失败时 EOD 仍用旧 stock_list 重写
+    dataset/stock_basic 副本（mtime=今天、内容=旧价），mtime 推断的
+    「快照所属日」被污染，全站把陈旧快照价当最新。此文件记录行情
+    字段真正拉到新数据的交易日；行情源失败时不 bump（保留旧值）。
+    """
+    return Path(data_dir) / "quote_asof.json"
+
+
+def read_quote_date(data_dir) -> Optional[str]:
+    """读 sidecar 的 quote_date（YYYY-MM-DD）；缺失/损坏/非法返回 None。"""
+    try:
+        obj = json.loads(quote_asof_path(data_dir).read_text(encoding="utf-8"))
+        d = obj.get("quote_date") if isinstance(obj, dict) else None
+        d = str(d)[:10] if d else None
+        if d and len(d) == 10 and d[4] == "-" and d[7] == "-":
+            return d
+        return None
+    except Exception:  # noqa: BLE001 读取端绝不因 sidecar 问题阻塞
+        return None
+
+
+def write_quote_date(data_dir, quote_date: str) -> None:
+    """写 sidecar（临时文件 + rename 原子替换，避免读到半个 JSON）。"""
+    p = quote_asof_path(data_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"quote_date": str(quote_date)[:10]}, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, p)
 
 
 def save_parquet(path: Path, df: pd.DataFrame) -> None:

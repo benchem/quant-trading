@@ -225,8 +225,18 @@ class DataStore:
     def _snapshot_date(self) -> pd.Timestamp | None:
         """快照所属交易日（近似 mtime→日，再回退到 ≤ 该日的最近交易日）；
         日线数据可能比快照更旧（部分更新只刷了 stock_list）——price_info
-        的锚点日 = min(快照日, 日线末根日)，各自取各自可用范围，无需此处校正。"""
+        的锚点日 = min(快照日, 日线末根日)，各自取各自可用范围，无需此处校正。
+
+        sidecar quote_asof.json 存在时取 min(quote_date, mtime 推断日)：
+        2026-11-02 事故——行情源失败时 EOD 仍用旧 stock_list 重写
+        dataset/stock_basic 副本（mtime=今天、内容=旧价），mtime 新 ≠ 行情新；
+        quote_date 是「行情字段真正拉到新数据的交易日」（行情源失败不 bump），
+        以它 clamp 防止把陈旧快照价锚到最新 K 线末根上。无 sidecar 的存量
+        部署回退现行 mtime 推断，行为不变。"""
         mday = getattr(self, "_snapshot_mtime_day", None)
+        qd = self._quote_asof_day()
+        if qd is not None:
+            mday = qd if mday is None else min(mday, qd)
         if mday is None:
             return None
         if len(self.calendar):
@@ -240,6 +250,18 @@ class DataStore:
             if len(cands):
                 mday = cands.max()
         return mday
+
+    def _quote_asof_day(self) -> pd.Timestamp | None:
+        """sidecar quote_asof.json 的行情所属日（downloader 行情成功时写入）。
+
+        缺失/损坏/非法返回 None（回退 mtime 推断，存量部署兼容）。
+        """
+        try:
+            obj = json.loads((self.root / "quote_asof.json").read_text(encoding="utf-8"))
+            d = obj.get("quote_date") if isinstance(obj, dict) else None
+            return pd.Timestamp(str(d)).normalize() if d else None
+        except Exception:  # noqa: BLE001 sidecar 问题绝不阻塞加载
+            return None
 
     def _load_board_members(self) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
         """板块成分表（downloader board 生成）；缺失返回 (None, None)（板块功能降级）。

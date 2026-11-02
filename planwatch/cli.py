@@ -97,9 +97,16 @@ def cmd_status(args) -> None:
           f"   浮盈 底仓 {upl_base:+,.0f} / 新仓 {upl_new:+,.0f}")
     print("-" * 64)
     print("关键位（距现价）：")
-    print(f"  T1 区间 {L['t1_zone'][0]}~{L['t1_zone'][1]:<8} [{'已成交' if 'T1' not in book['pending'] else '待触发'}]  {_dist(P, L['t1_zone'][0])}")
-    print(f"  T2 区间 {L['t2_zone'][0]}~{L['t2_zone'][1]:<8} [{'已成交' if 'T2' not in book['pending'] else '待触发'}]  {_dist(P, L['t2_zone'][0])}")
-    print(f"  T3 突破 {L['t3_breakout']:<10} [{'已成交' if 'T3' not in book['pending'] else '待触发'}]  {_dist(P, L['t3_breakout'])}")
+    tr_map = {t["id"]: t for t in plan["tranches"]}
+
+    def _tr_st(tid: str) -> str:
+        if tid in book["pending"]:
+            return "待触发"
+        return "已砍(v2)" if tr_map.get(tid, {}).get("status") == "killed" else "已成交"
+
+    print(f"  T1 区间 {L['t1_zone'][0]}~{L['t1_zone'][1]:<8} [{_tr_st('T1')}]  {_dist(P, L['t1_zone'][0])}")
+    print(f"  T2 区间 {L['t2_zone'][0]}~{L['t2_zone'][1]:<8} [{_tr_st('T2')}]  {_dist(P, L['t2_zone'][0])}")
+    print(f"  T3 突破 {L['t3_breakout']:<10} [{_tr_st('T3')}]  {_dist(P, L['t3_breakout'])}")
     print(f"  软止损 {L['soft_stop']:<10} {_dist(P, L['soft_stop'])}   硬止损 {L['hard_stop']:<9} {_dist(P, L['hard_stop'])}")
     for tp in plan["take_profit_plan"]:
         st = "已完成" if tp["id"] in book.get("tp_done", []) else "待触发"
@@ -123,7 +130,7 @@ TIME_HOOKS = {
     "11:30": ("info", "午盘休市，留意午间公告"),
     "13:00": ("info", "午后开盘"),
     "14:38": ("warn", "⏰ 距 14:40 还有 2 分钟：检查 T 是否未对冲，14:50 前必须全部了结"),
-    "14:57": ("warn", "⏰ 收盘前 3 分钟：T3 看量能收盘确认 / 未对冲 T 必须了结"),
+    "14:57": ("warn", "⏰ 收盘前 3 分钟：T2 四条件逐条核对（未破 25.50/额≤3.2亿/收≥26.0/低点>23.34）/ 未对冲 T 必须了结"),
 }
 
 
@@ -186,8 +193,9 @@ def cmd_monitor(args) -> None:
     print("=" * 64)
     print(f"计划盯盘 {code} {plan['name']}   {now_cst():%Y-%m-%d %H:%M}")
     print(f"目标 {t['price']}（截止 {t['deadline']}）  |  {_pos_desc(book)}  |  现金 {book['cash']:,.0f}")
+    tp_list = "·".join(str(tp["price"]) for tp in plan["take_profit_plan"])
     print(f"关键位: T1 {L['t1_zone'][0]}~{L['t1_zone'][1]} / T2 {L['t2_zone'][0]}~{L['t2_zone'][1]}"
-          f" / T3>{L['t3_breakout']} / 止损 {L['soft_stop']}·{L['hard_stop']} / 止盈 36.5·43·50")
+          f" / T3>{L['t3_breakout']} / 止损 {L['soft_stop']}·{L['hard_stop']} / 止盈 {tp_list}")
     print("提醒: 本窗口 + macOS 系统通知 + watchlog/alerts.jsonl    退出: Ctrl+C")
     print("=" * 64)
     last_min, errors, q, reported = "", 0, None, False

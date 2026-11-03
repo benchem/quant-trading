@@ -109,10 +109,11 @@ def main():
     remaining("3.流通市值30~300亿")
 
     # 4. 成交额 >= 2亿
-    # 注：hfq 文件 amount 列在基准日几乎全为 NaN（5223 中仅 3 只有值），
-    # 校准（000028.SZ: amount 9946.5万 / volume 46639手×100 = 21.3元/股）确认
-    # volume 单位为手。成交额以 volume×100×latest_price(原始价) 估算。
-    dfb["amount_yi"] = dfb["volume"] * 100.0 * dfb["latest_price"] / 1e8
+    # 注：amount 列 2026-11-03 起已全量修复（5215/5215 填充，300687 对腾讯实测 4.26亿 一致）。
+    # 优先用文件内真实 amount；缺失时回退 volume×100×latest_price(原始价) 估算（volume 单位=手）。
+    dfb["amount_yi"] = dfb.apply(
+        lambda r: r["amount"] / 1e8 if pd.notna(r["amount"]) and r["amount"] > 0
+        else r["volume"] * 100.0 * r["latest_price"] / 1e8, axis=1)
     dfb = dfb[dfb["amount_yi"] >= 2.0]
     remaining("4.成交额>=2亿")
 
@@ -158,6 +159,7 @@ def main():
     remaining("10.近20日涨幅<=+30%")
 
     # 11. 板块效应
+    pre11 = dfb.copy()  # 近失名单：死在本层前的幸存者（0 候选日诊断用）
     dfb["board_avg_pct"] = dfb["board_code"].map(board_avg)
     has_ind = dfb["board_code"].notna()
     dfb = dfb[~has_ind | (dfb["board_avg_pct"] >= 0.015)]
@@ -181,32 +183,51 @@ def main():
 
     csv_path = f"scan_ultrashort_{base_date.strftime('%Y%m%d')}.csv"
     md_path = f"scan_ultrashort_{base_date.strftime('%Y%m%d')}.md"
-    all_cols = ["code", "name", "行业", "今pct", "量比", "收盘位置", "距60日高%", "20日涨幅%",
-                "流通市值亿", "成交额亿", "突破类型", "板块均涨幅", "综合分"]
-    top.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    buy_date = base_date + pd.Timedelta(days=1)
+    while buy_date.weekday() >= 5:
+        buy_date += pd.Timedelta(days=1)
+    sell_date = buy_date + pd.Timedelta(days=4 - buy_date.weekday())  # 袖仓纪律：周五 14:50 强平
 
-    lines = [f"# 超短线候选扫描报告（基准日 {base_date.date()}，买入 2026-11-03，11-06 前卖出）", "",
+    # 近失名单（0 候选日诊断：死在第 11 层板块效应）
+    near_out = None
+    if len(dfb) == 0 and len(pre11):
+        near = pre11.sort_values("vol_ratio", ascending=False).head(10).copy()
+        near["board_avg_pct"] = near["board_code"].map(board_avg)
+        near["board_name"] = near["board_name"].fillna("无行业")
+        near_out = near[["code", "name", "board_name", "pct", "vol_ratio", "close_pos",
+                         "pct20", "signal", "board_avg_pct"]].copy()
+        for c, nd in [("pct", 4), ("vol_ratio", 2), ("close_pos", 2), ("pct20", 4), ("board_avg_pct", 4)]:
+            near_out[c] = near_out[c].astype(float).round(nd)
+
+    lines = [f"# 超短线候选扫描报告（基准日 {base_date.date()}，买入 {buy_date.date()}，{sell_date.date()} 14:50 前卖出）", "",
              f"最终候选 {len(dfb)} 只，按综合分 = 量比 × 收盘位置 × 板块平均涨幅 取 Top {min(TOP_N, len(top))}。",
              "",
-             "> 注：hfq 日线 amount 列在基准日几乎全空（5223 只中仅 3 只有值），成交额列为",
-             "> `volume×100×latest_price` 估算值（volume 单位=手，已用 3 只有真实 amount 的文件校准）。",
+             "> 注：amount 列 2026-11-03 起已全量修复（5215/5215，300687 对腾讯实测 4.26亿 一致）。",
+             "> 成交额优先取文件内真实 amount，缺失时回退 volume×100×latest_price 估算。",
              ""]
     if len(top):
         lines.append(top.to_markdown(index=False))
     else:
         lines.append("（无候选）")
+    if near_out is not None:
+        lines += ["", "## 近失名单（死在第 11 层板块效应，板块均涨 <+1.5%）", "", near_out.to_markdown(index=False)]
     lines += ["", "## 过滤漏斗", ""] + [f"- {s}" for s in steps] + [""]
     with open(md_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
+    top.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     print("\n" + "\n".join(steps))
     print()
     if len(top):
         print(top.to_string(index=False))
+    if near_out is not None:
+        print("\n## 近失名单（死在第 11 层板块效应）")
+        print(near_out.to_string(index=False))
     print(f"\n输出: {csv_path}, {md_path}")
 
 
 if __name__ == "__main__":
     main()
     import os
+    sys.stdout.flush()
     os._exit(0)  # 跳过 pyarrow/pandas 关闭阶段（本环境解释器退出时会 core dump）

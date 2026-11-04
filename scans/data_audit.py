@@ -24,8 +24,10 @@ DATA = '/opt/quant-trading/data/daily/hfq'
 
 
 def audit(save=None):
+    import re
+    pat = re.compile(r'^\d{6}\.(SH|SZ)\.parquet$')  # 只认标准代码文件，排除 .bak-* 等备份
     stats = {'clean': 0, 'dirty': [], 'missing_last': []}
-    files = sorted(os.listdir(DATA))
+    files = sorted(f for f in os.listdir(DATA) if pat.match(f))
     t0 = datetime.now()
     for i, f in enumerate(files):
         code = f.replace('.parquet', '')

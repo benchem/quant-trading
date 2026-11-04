@@ -276,12 +276,16 @@ def _gtimg_symbol(wind_code: str) -> str:
 def fetch_gtimg_quotes(wind_codes) -> dict[str, dict]:
     """腾讯实时行情批量（GBK）：{wind_code: 行情字段}。
 
-    响应形如 ``v_sz300687="51~名称~代码~现价~昨收~..."``（~ 分隔）：
-    3=现价、4=昨收、37=成交额(万元)、38=换手率、44=流通市值(亿)、45=总市值(亿)。
+    响应形如 ``v_sz300687="51~名称~代码~现价~昨收~...~"``（~ 分隔）：
+    3=现价、4=昨收、6=成交量、30=行情时间(yyyymmddHHMMSS)、37=成交额(万元)、
+    38=换手率、44=流通市值(亿)、45=总市值(亿)。
     市值 ×1e8 存元（与 stock_list/stock_basic 单位一致，
     对照 300687 total_mv=9.724e9=97.24 亿）。成交额 ×1e4 存元（300687
     f37=64668 万 = 646679903.28 元，与分钟线推导一致），供日线 amount
     缺失回补（2026-11-02 事故：sina 兜底日线源无 amount 字段）。
+    volume 原样返回（主/创/科 qt 均为手口径的原始 f6；科创板实测为股，
+    与 bar 的手差 100 倍，由量指纹守卫的比值带兜底）；quote_time 供
+    「行情所属日 vs 对账日」匹配（2026-11-04 事故：快照缓存对账）。
     停牌/缺字段的代码不返回，
     由调用方保留旧值。全部批次无任何有效行情时 raise FetchError
     （兜底源也失败的判定依据：调用方不得 bump sidecar）。
@@ -321,6 +325,8 @@ def fetch_gtimg_quotes(wind_codes) -> dict[str, dict]:
                 "turnover": fl(38),
                 "float_mv": (fl(44) * 1e8) if fl(44) is not None else None,
                 "total_mv": (fl(45) * 1e8) if fl(45) is not None else None,
+                "volume": fl(6),
+                "quote_time": f[30] if len(f) > 30 else None,
             }
     if not out:
         raise FetchError(f"腾讯实时行情全部无有效数据 ({len(codes)} 只)")

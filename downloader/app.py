@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import re
 import threading
@@ -465,6 +466,146 @@ class Downloader:
              f"{f'{prev_cov * 100:.1f}%' if prev_cov is not None else '无数据'}）"
              f"-> 腾讯行情回补 {written} 只，{skipped} 只停牌/无行情未动")
         return _check(coverage, prev_cov, True, written, skipped)
+
+    def verify_daily_vintage(self, day=None) -> dict:
+        """当日 bar 量指纹守卫（2026-11-04 事故：sina CDN 盘中快照缓存）。
+
+        事故：15:33 EOD 时 sina 日线 CDN 仍回 14 时快照，000 段 35 只当日
+        bar 的量为真实量的 0.1%~70%、价为盘中价；价差常 <0.5% 难以阈值
+        判别，量指纹最稳（量不受复权/除权影响，跨源一致）。
+
+        对账：当日有 K 线的代码 × 腾讯实时行情（fetch_gtimg_quotes 的
+        volume，独立于日线源）。比值带判正常——r=bar/行情 ∈ [0.95,1.05]
+        （同口径）或 [0.009,0.011]（科创板行情为股、bar 为手的 100 倍
+        单位差，非坏 bar）；其余判「盘中快照」嫌疑。北交所（.BJ）口径
+        未验证，跳过不判。行情 quote_time 与对账日不符（跨日重跑）跳过。
+
+        处置（宁缺勿错）：嫌疑行从单股文件删除（原子写，删前整行落
+        审计 jsonl data/vintage_dropped_{adjust}.jsonl），登记待修清单
+        （reason 含日期），由次日 EOD repair_stocks 全量重拉自愈；
+        合并表含当日行时同步删行。幂等：二次运行当日无行即 no-op。
+
+        返回 {day, checked, suspects, dropped, skipped}（挂
+        self.last_vintage_check 供 EOD 编排层打日志）。
+        """
+        day_arg = str(day) if day else dt.date.today().isoformat()
+        ts = pd.Timestamp(day_arg[:10])
+        if ts is pd.NaT:
+            raise ValueError(f"量指纹守卫: 非法对账日 {day!r}")
+        ts = ts.normalize()
+        day_s = str(ts.date())
+        result = {"day": day_s, "checked": 0, "suspects": 0,
+                  "dropped": 0, "skipped": 0}
+        self.last_vintage_check = result
+        merged_p = store.dataset_dir(self.data_dir) / f"daily_{self.adjust}.parquet"
+        ddir = store.daily_dir(self.data_dir, self.adjust)
+
+        # ---- 当日行：优先合并表（EOD dataset 阶段后）；没有则扫单股目录
+        merged = None
+        if merged_p.exists():
+            try:
+                merged = pd.read_parquet(merged_p, columns=["date", "code", "volume"])
+                merged["date"] = pd.to_datetime(merged["date"]).dt.normalize()
+            except Exception as e:  # noqa: BLE001 合并表损坏按无合并表处理
+                _log(f"警告: daily 合并表读取失败（按单股目录扫描）: {e}")
+                merged = None
+        rows = None
+        if merged is not None and len(merged):
+            rows = merged[merged["date"] == ts]
+        if rows is None or not len(rows):
+            parts = []
+            for f in sorted(ddir.glob("*.parquet")):
+                try:
+                    t = pd.read_parquet(f, columns=["date", "code", "volume"])
+                except Exception:  # noqa: BLE001 单文件损坏跳过
+                    continue
+                t = t[pd.to_datetime(t["date"]).dt.normalize() == ts]
+                if len(t):
+                    parts.append(t)
+            rows = pd.concat(parts, ignore_index=True) if parts else None
+        if rows is None or not len(rows):
+            _log(f"量指纹守卫: {day_s} 当日无 K 线（EOD 未拉到），跳过")
+            return result
+
+        codes = sorted(set(rows["code"].astype(str)))
+        try:
+            quotes = source.fetch_gtimg_quotes(codes)
+        except Exception as e:  # noqa: BLE001 行情失败不碰数据（无真值不删）
+            _log(f"警告: 量指纹守卫行情拉取失败，跳过: {e}")
+            return result
+
+        vol_by_code = {str(r["code"]): float(r["volume"])
+                       for _, r in rows.iterrows() if pd.notna(r["volume"])}
+        day_compact = ts.strftime("%Y%m%d")
+        bands = ((0.95, 1.05), (0.009, 0.011))  # 同口径 / 科创板股-vs-手
+        suspects: list[tuple[str, float, float]] = []
+        for code, bv in vol_by_code.items():
+            if code.endswith(".BJ"):
+                result["skipped"] += 1  # 北交所量口径未验证
+                continue
+            q = quotes.get(code) or {}
+            qv = q.get("volume")
+            qt_day = str(q.get("quote_time") or "")[:8]
+            if not qv or qv <= 0:
+                result["skipped"] += 1  # 停牌/无行情
+                continue
+            if qt_day and qt_day != day_compact:
+                result["skipped"] += 1  # 行情非对账日（跨日重跑）
+                continue
+            result["checked"] += 1
+            r = bv / qv
+            if any(lo <= r <= hi for lo, hi in bands):
+                continue
+            suspects.append((code, bv, qv))
+        result["suspects"] = len(suspects)
+        if not suspects:
+            _log(f"量指纹守卫: {day_s} 对账 {result['checked']} 只全部正常"
+                 f"（{result['skipped']} 只停牌/口径跳过）")
+            return result
+
+        # ---- 删嫌疑行（审计留痕）+ 登记待修，次日 repair_stocks 全量重拉
+        audit_p = self.data_dir / f"vintage_dropped_{self.adjust}.jsonl"
+        audit_p.parent.mkdir(parents=True, exist_ok=True)
+        for code, bv, qv in suspects:
+            f = ddir / f"{code}.parquet"
+            try:
+                df = pd.read_parquet(f, engine="pyarrow")
+            except Exception as e:  # noqa: BLE001 单股失败跳过（其余照删）
+                _log(f"警告: {code} 日线读取失败，跳过删行: {e}")
+                continue
+            mask = pd.to_datetime(df["date"]).dt.normalize() == ts
+            if not mask.any():
+                continue
+            with audit_p.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "ts": dt.datetime.now().isoformat(timespec="seconds"),
+                    "day": day_s, "code": code,
+                    "bar_volume": int(bv), "quote_volume": int(qv),
+                    "ratio": round(bv / qv, 6),
+                    "dropped_rows": df.loc[mask].to_dict("records"),
+                }, ensure_ascii=False, default=str) + "\n")
+            _atomic_parquet(f, df.loc[~mask])
+            self._pending_repair_add(
+                code, f"量指纹守卫: {day_s} bar量{int(bv)} < 行情量{int(qv)}"
+                      f"（盘中快照，已删行待全量重拉）")
+            result["dropped"] += 1
+            _log(f"量指纹守卫: {code} {day_s} bar量 {int(bv)} vs 行情量 "
+                 f"{int(qv)}（比值 {bv / qv:.4f}）判盘中快照 -> 删行+登记待修")
+
+        # 合并表同步删行（仅当其本身含当日行时；否则等 build_dataset 重建）
+        if merged is not None and len(merged) and bool((merged["date"] == ts).any()):
+            try:
+                full = pd.read_parquet(merged_p, engine="pyarrow")
+                m = (pd.to_datetime(full["date"]).dt.normalize() == ts) \
+                    & full["code"].isin([c for c, _, _ in suspects])
+                if m.any():
+                    _atomic_parquet(merged_p, full.loc[~m])
+            except Exception as e:  # noqa: BLE001 合并表失败不影响单股文件
+                _log(f"警告: daily 合并表量指纹删行失败: {e}")
+        _log(f"量指纹守卫: {day_s} 对账 {result['checked']} 只，"
+             f"嫌疑 {len(suspects)} 只，删行 {result['dropped']} 只"
+             f"（已登记待修，次日全量重拉自愈）")
+        return result
 
     def _stock_list(self) -> pd.DataFrame:
         p = store.stock_list_path(self.data_dir)

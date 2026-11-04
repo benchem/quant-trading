@@ -641,6 +641,19 @@ class EodUpdater:
             except Exception as e:  # noqa: BLE001 回补失败不阻塞主链路
                 self._error(f"当日成交额回补失败: {e}")
 
+        # 4d. 量指纹守卫（2026-11-04 事故：sina CDN 盘中快照缓存被 15:33
+        #     EOD 写成当日 bar，000 段 35 只量为真实量的 0.1%~70%）。
+        #     当日 bar 量 × 腾讯实时行情对账，嫌疑删行+登记待修清单，
+        #     次日 EOD repair_stocks 全量重拉自愈（宁缺勿错）。
+        if hasattr(dl, "verify_daily_vintage"):
+            try:
+                chk = dl.verify_daily_vintage(day)
+                print(f"[eod] 量指纹守卫: 对账 {chk['checked']} 只 / "
+                      f"删行 {chk['dropped']} 只（{chk['skipped']} 只停牌/口径跳过）",
+                      flush=True)
+            except Exception as e:  # noqa: BLE001 守卫失败不阻塞主链路
+                self._error(f"量指纹守卫失败: {e}")
+
         # 5. 指数
         self._stage("index")
         try:

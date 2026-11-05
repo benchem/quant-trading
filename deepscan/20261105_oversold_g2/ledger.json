@@ -1,0 +1,25 @@
+{
+  "object": "超跌回归 G2 策略 + 11-06 实盘开仓计划",
+  "session": "deepscan/20261105_oversold_g2",
+  "gate": "M2：30 轮对抗存活线 96/100；今晚 R1 结论决定 11-06 是否放行",
+  "started": "2026-11-05 21:30",
+  "max_rounds": 30,
+  "rounds": [
+    {
+      "round": 1,
+      "wave": "R1 五流派独立攻击",
+      "reviewers": [
+        {"role": "统计官", "angle": "多重检验/有效样本量/右尾依赖/先验冻结违规"},
+        {"role": "执行官", "angle": "开盘入场可行性/hfq与真实价/成本摩擦/出场涨停锁死/停牌"},
+        {"role": "风控官", "angle": "无止损回测/同日共振相关性/槽位规模/kill-switch联动"},
+        {"role": "市场结构官", "angle": "小市值因子代理/风格切换/拥挤度/制度变化"},
+        {"role": "数据官", "angle": "市值ST前视/脏bar影响/幸存者偏差/G2闸数据完整性"}
+      ],
+      "status": "launched",
+      "launched_at": "2026-11-05 21:30"
+    }
+  ],
+  "scores": [],
+  "verdict": null,
+  "fix_log": []
+}

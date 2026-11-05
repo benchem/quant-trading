@@ -702,9 +702,14 @@
     </div>
     </div>
 
-    <!-- 收益统计：每日已实现盈亏（与「交易流水」独立的子标签） -->
+    <!-- 收益统计：每日已实现盈亏 / 每日浮动盈亏（与「交易流水」独立的子标签） -->
     <div class="tt-subpanel" data-tt-panel="stats">
       <div class="toolbar">
+        <span class="toolbar-label">口径</span>
+        <div class="btn-group" id="stats-mode">
+          <button data-mode="realized">已实现盈亏</button>
+          <button data-mode="floating">浮动盈亏</button>
+        </div>
         <span class="toolbar-label">范围</span>
         <div class="btn-group" id="stats-range">
           <button data-range="year">本年</button>
@@ -714,8 +719,14 @@
         </div>
         <span class="hint" id="stats-summary" style="margin:0"></span>
       </div>
+
+      <div class="chart-box" id="pnl-chart-box" style="display:none">
+        <div class="chart-title">每日浮动盈亏走势（持仓市值 − 持仓成本，按各股日线后复权×真实价锚折算 · 停牌日沿用最近收盘）</div>
+        <div id="stats-pnl-chart" style="height:300px"></div>
+      </div>
+
       <div class="chart-box">
-        <div class="chart-title">每日收益（已实现盈亏按移动加权成本逐笔核算，归集到卖出日 · 买入日无已实现收益 · 点击股票跳转个股）</div>
+        <div class="chart-title" id="stats-table-title">每日收益（已实现盈亏按移动加权成本逐笔核算，归集到卖出日 · 买入日无已实现收益 · 点击股票跳转个股）</div>
         <div class="table-wrap" style="max-height:520px">
           <table class="rank-table" id="stats-table">
             <thead>
@@ -728,6 +739,21 @@
                 <th class="num" title="当日费用（实际值或按费率估算）">费用</th>
                 <th class="num" title="当日卖出按移动加权成本计算的已实现盈亏（不含费用，与持仓汇总口径一致）">当日已实现盈亏</th>
                 <th>涉及股票</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+            <tfoot></tfoot>
+          </table>
+          <table class="rank-table" id="stats-float-table" style="display:none">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th class="num" title="当日收盘仍有持仓的股票只数">持仓只数</th>
+                <th class="num" title="Σ 收盘价×持仓股数（真实价口径）">持仓市值</th>
+                <th class="num" title="Σ 移动加权成本×持仓股数（不含费用，与持仓汇总口径一致）">持仓成本</th>
+                <th class="num" title="持仓市值 − 持仓成本">浮动盈亏</th>
+                <th class="num" title="浮动盈亏较上一交易日的变动（含当日买入/卖出带来的仓变化）">当日变动</th>
+                <th class="num" title="当日卖出按移动加权成本核算的已实现盈亏">当日已实现</th>
               </tr>
             </thead>
             <tbody></tbody>

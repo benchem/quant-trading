@@ -60,6 +60,9 @@ const state = {
     batchRows: [],      // 批量解析结果（待导入）
     batchCode: null,    // 批量目标股票
     statsRange: lsGet("tradesStatsRange", "month"),  // 收益统计范围: year | month | week | all
+    statsMode: lsGet("tradesStatsMode", "realized"), // 收益统计口径: realized | floating
+    klines: {},         // code -> {dates[], close[], name}（浮动盈亏用，按需拉取）
+    klinesLoading: false,
   },
   // 费用估算模型（localStorage 持久化）：佣金‱ / 每笔最低元；印花/过户为市场固定值
   feeCfg: (() => {
@@ -1594,6 +1597,7 @@ async function loadTradesPage() {
     const d = await api("/api/trades");
     state.tradesPage.trades = d.trades || [];
     state.tradesPage.meta = d.meta || {};
+    state.tradesPage.klines = {};   // 清缓存：收盘价随 EOD 更新，进页重拉保证新鲜
   } catch (err) {
     toast("交易记录加载失败: " + err.message);
     return;
@@ -1818,7 +1822,7 @@ function computeDailyStats(trades) {
   return Object.values(days).sort((a, b) => (a.date < b.date ? 1 : -1));
 }
 
-function renderTradesStats() {
+async function renderTradesStats() {
   const tb = $("#stats-table tbody");
   const tf = $("#stats-table tfoot");
   if (!tb) return;
@@ -1838,6 +1842,31 @@ function renderTradesStats() {
         + "（已实现，不含费用）";
     }
   }
+
+  // 口径切换：浮动盈亏需要各持仓股日线（收盘价序列），按需拉取
+  const floating = p.statsMode === "floating";
+  $("#stats-table").style.display = floating ? "none" : "";
+  $("#stats-float-table").style.display = floating ? "" : "none";
+  $("#pnl-chart-box").style.display = floating ? "" : "none";
+  $("#stats-table-title").textContent = floating
+    ? "每日浮动盈亏（持仓市值 − 持仓成本 · 收盘价折算 · 当日变动含买卖带来的仓变化）"
+    : "每日收益（已实现盈亏按移动加权成本逐笔核算，归集到卖出日 · 买入日无已实现收益 · 点击股票跳转个股）";
+  if (floating) {
+    const need = [...new Set(p.trades.map((t) => t.code))].filter((c) => !(c in p.klines));
+    if (need.length) {
+      const firstDate = (code) =>
+        p.trades.filter((t) => t.code === code).reduce((m, t) => (t.date < m ? t.date : m), "9999-12-31");
+      await Promise.all(need.map(async (code) => {
+        try {
+          const d = await api("/api/kline?code=" + code + "&start=" + firstDate(code));
+          p.klines[code] = { dates: d.dates, close: d.close, name: d.name };
+        } catch (_) { p.klines[code] = null; }   // 失败标记，避免反复重试
+      }));
+    }
+    renderTradesStatsFloat(daily);
+    return;
+  }
+
   const start = statsRangeStart(p.statsRange);
   const rows = daily.filter((d) => !start || d.date >= start);
   tb.innerHTML = rows.length
@@ -1879,6 +1908,158 @@ function renderTradesStats() {
         <td></td>
       </tr>`;
     }
+  }
+}
+
+/** 浮动盈亏序列：按全交易日历逐日重放 —— 每股持仓/成本随交易日推进，市值=Σ收盘×持仓。 */
+function computeFloatingSeries(trades, klines, realizedByDate) {
+  const byCode = {};
+  for (const t of trades) (byCode[t.code] = byCode[t.code] || []).push(t);
+  // 交易日历 = 各 K 线日期并集（去重升序）
+  const cal = [...new Set(Object.values(klines || {}).flatMap((k) => (k ? k.dates : [])))].sort();
+  // 每股游标：trades 指针 + 持仓/成本 + K 线日期指针 + 最近收盘
+  const st = {};
+  for (const code of Object.keys(byCode)) {
+    st[code] = {
+      list: byCode[code].slice().sort((a, b) => (a.date + a.created < b.date + b.created ? -1 : 1)),
+      ti: 0, held: 0, avg: 0, ki: 0, lastClose: null,
+    };
+  }
+  const out = [];
+  let prevFloat = 0, cumRealized = 0;
+  const realizedSorted = Object.entries(realizedByDate || {}).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  let ri = 0;
+  for (const d of cal) {
+    while (ri < realizedSorted.length && realizedSorted[ri][0] <= d) {
+      cumRealized += realizedSorted[ri][1];
+      ri++;
+    }
+    let mv = 0, cost = 0, nPos = 0;
+    for (const code of Object.keys(st)) {
+      const s = st[code];
+      // 推进该股当日及以前的成交（停牌日成交归到下一交易日生效）
+      while (s.ti < s.list.length && s.list[s.ti].date <= d) {
+        const t = s.list[s.ti++];
+        const amt = t.price * t.shares;
+        if (t.side === "buy") {
+          s.avg = (s.avg * s.held + amt) / (s.held + t.shares);
+          s.held += t.shares;
+        } else {
+          s.held = Math.max(0, s.held - t.shares);
+        }
+      }
+      // 推进该股收盘价到 ≤ d 的最近一根
+      const k = klines[code];
+      if (k) {
+        while (s.ki < k.dates.length && k.dates[s.ki] <= d) {
+          const c = k.close[s.ki];
+          if (c != null) s.lastClose = c;
+          s.ki++;
+        }
+      }
+      if (s.held > 0 && s.lastClose != null) {
+        mv += s.lastClose * s.held;
+        cost += s.avg * s.held;
+        nPos++;
+      }
+    }
+    const floating = mv - cost;
+    out.push({
+      date: d, mv, cost, nPos, floating,
+      change: floating - prevFloat,       // 当日浮动盈亏变动
+      cumTotal: floating + cumRealized,   // 总收益 = 浮动 + 累计已实现
+      realized: realizedByDate[d] || 0,
+    });
+    prevFloat = floating;
+  }
+  return out;
+}
+
+function renderTradesStatsFloat(daily) {
+  const p = state.tradesPage;
+  const tb = $("#stats-float-table tbody");
+  const tf = $("#stats-float-table tfoot");
+  const realizedByDate = {};
+  for (const d of daily) realizedByDate[d.date] = d.realized;
+  const series = computeFloatingSeries(p.trades, p.klines, realizedByDate);
+  const start = statsRangeStart(p.statsRange);
+  const rows = series.filter((d) => !start || d.date >= start);
+  const last = rows.length ? rows[rows.length - 1] : null;
+  const sm = $("#stats-summary");
+  if (sm) {
+    if (!series.length) sm.textContent = p.trades.length ? "无日线数据，无法计算浮动盈亏" : "";
+    else if (last) {
+      const chip = (label, v) => `${label} <b class="${pctCls(v)}">${fmtSignedNum(v)}</b>`;
+      sm.innerHTML = chip("最新浮动", last.floating)
+        + (last.date ? `（${last.date}）` : "")
+        + " · " + chip("当日变动", last.change)
+        + " · " + chip("本年已实现", daily.reduce((s, d) => (d.date >= statsRangeStart("year") ? s + d.realized : s), 0));
+    }
+  }
+  tb.innerHTML = rows.length
+    ? rows.slice().reverse().map((d) => `
+      <tr>
+        <td>${d.date}</td>
+        <td class="num">${d.nPos || "—"}</td>
+        <td class="num">${d.mv ? fmtNum(d.mv) : "—"}</td>
+        <td class="num" style="color:var(--text-dim)">${d.cost ? fmtNum(d.cost) : "—"}</td>
+        <td class="num ${pctCls(d.floating)}" style="font-weight:600">${fmtSignedNum(d.floating)}</td>
+        <td class="num ${pctCls(d.change)}">${fmtSignedNum(d.change)}</td>
+        <td class="num ${d.realized ? pctCls(d.realized) : ""}" style="color:var(--text-dim)">${d.realized ? fmtSignedNum(d.realized) : "—"}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="7" class="hint" style="padding:12px">该范围内暂无交易记录</td></tr>`;
+  if (tf) {
+    if (!last) tf.innerHTML = "";
+    else {
+      const periodChange = last.floating - (rows.length ? rows[0].floating - rows[0].change : 0);
+      tf.innerHTML = `<tr>
+        <td style="text-align:left;font-weight:600">期末（${last.date}）· ${rows.length} 个交易日</td>
+        <td class="num">${last.nPos || "—"}</td>
+        <td class="num">${fmtNum(last.mv)}</td>
+        <td class="num">${fmtNum(last.cost)}</td>
+        <td class="num ${pctCls(last.floating)}" style="font-weight:600">${fmtSignedNum(last.floating)}</td>
+        <td class="num ${pctCls(periodChange)}" title="范围内浮动盈亏变化 = 期末 − 期初前一日">${fmtSignedNum(periodChange)}</td>
+        <td class="num"></td>
+      </tr>`;
+    }
+  }
+  // 折线图：浮动盈亏 + 总收益（浮动 + 累计已实现）
+  const box = $("#pnl-chart-box");
+  if (box && box.style.display !== "none" && series.length) {
+    const c = mkChart("stats-pnl-chart");
+    c.setOption({
+      tooltip: {
+        ...TOOLTIP,
+        valueFormatter: (v) => (v == null ? "—" : fmtSignedNum(v)),
+      },
+      legend: { top: 0, textStyle: { color: "#8b98ab", fontSize: 11 }, itemWidth: 14 },
+      grid: { left: 64, right: 18, top: 34, bottom: 48 },
+      xAxis: { type: "category", data: series.map((d) => d.date), ...AXIS },
+      yAxis: {
+        type: "value", ...AXIS,
+        axisLabel: { ...AXIS.axisLabel, formatter: (v) => fmtNum(v, 0) },
+        splitLine: { ...AXIS.splitLine },
+      },
+      dataZoom: [{ type: "inside" }, { type: "slider", height: 14, bottom: 10, borderColor: "#2a3342", backgroundColor: "#161b24", fillerColor: "rgba(79,142,247,.2)", textStyle: { color: "#8b98ab" } }],
+      series: [
+        {
+          name: "浮动盈亏", type: "line", data: series.map((d) => +d.floating.toFixed(2)),
+          showSymbol: false, lineStyle: { width: 1.8 }, itemStyle: { color: "#4f8ef7" },
+          areaStyle: { color: "rgba(79,142,247,.12)" }, emphasis: { focus: "series" },
+          markLine: {
+            symbol: "none", silent: true,
+            lineStyle: { color: "rgba(139,152,171,.5)", type: "dashed" },
+            data: [{ yAxis: 0 }], label: { show: false },
+          },
+        },
+        {
+          name: "总收益（浮+累计已实现）", type: "line", data: series.map((d) => +d.cumTotal.toFixed(2)),
+          showSymbol: false, lineStyle: { width: 1.6, type: "dashed" }, itemStyle: { color: "#e6a23c" },
+          emphasis: { focus: "series" },
+        },
+      ],
+    });
+    c.resize();
   }
 }
 
@@ -4470,10 +4651,20 @@ async function bootstrap() {
   $("#fee-comm").addEventListener("input", onFeeCfg);
   $("#fee-min").addEventListener("input", onFeeCfg);
 
-  // 交易记录页子标签（交易流水 / 收益统计）+ 收益统计范围切换（localStorage 记忆）
+  // 交易记录页子标签（交易流水 / 收益统计）+ 收益统计口径与范围切换（localStorage 记忆）
   $$("#trades-subtabs .tt-subtab").forEach((b) =>
     b.addEventListener("click", () => switchTradesSub(b.dataset.tt))
   );
+  $("#stats-mode").querySelectorAll("button").forEach((b) => {
+    if (b.dataset.mode === state.tradesPage.statsMode) b.classList.add("active");
+    b.addEventListener("click", () => {
+      $("#stats-mode").querySelectorAll("button").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      state.tradesPage.statsMode = b.dataset.mode;
+      lsSet("tradesStatsMode", b.dataset.mode);
+      renderTradesStats();
+    });
+  });
   $("#stats-range").querySelectorAll("button").forEach((b) => {
     if (b.dataset.range === state.tradesPage.statsRange) b.classList.add("active");
     b.addEventListener("click", () => {

@@ -14,3 +14,10 @@ deploy.env
 .dsh/
 plan_*.json
 trading_plan_*.md
+
+# 个人交易信息不入公共仓库（2026-11-05 GitHub 历史清除后封口）
+monitoring/
+docs/reports/
+deepscan/2026*_t5_3stocks/
+deepscan/*/digest.md
+deepscan/*/计分表_top10.*

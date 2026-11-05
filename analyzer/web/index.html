@@ -557,6 +557,12 @@
 
   <!-- ===================== 交易记录（自选股买卖台账 CRUD） ===================== -->
   <section id="tab-trades" class="panel">
+    <div class="tt-subtabs" id="trades-subtabs">
+      <button class="tt-subtab active" data-tt="flow">交易流水</button>
+      <button class="tt-subtab" data-tt="stats">收益统计</button>
+    </div>
+
+    <div class="tt-subpanel active" data-tt-panel="flow">
     <div class="toolbar">
       <span class="toolbar-label">范围</span>
       <div class="btn-group" id="trades-scope">
@@ -692,6 +698,42 @@
           <tbody></tbody>
           <tfoot></tfoot>
         </table>
+      </div>
+    </div>
+    </div>
+
+    <!-- 收益统计：每日已实现盈亏（与「交易流水」独立的子标签） -->
+    <div class="tt-subpanel" data-tt-panel="stats">
+      <div class="toolbar">
+        <span class="toolbar-label">范围</span>
+        <div class="btn-group" id="stats-range">
+          <button data-range="year">本年</button>
+          <button data-range="month">本月</button>
+          <button data-range="week">本周</button>
+          <button data-range="all">全部</button>
+        </div>
+        <span class="hint" id="stats-summary" style="margin:0"></span>
+      </div>
+      <div class="chart-box">
+        <div class="chart-title">每日收益（已实现盈亏按移动加权成本逐笔核算，归集到卖出日 · 买入日无已实现收益 · 点击股票跳转个股）</div>
+        <div class="table-wrap" style="max-height:520px">
+          <table class="rank-table" id="stats-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th class="num" title="当日买入笔数">买入</th>
+                <th class="num" title="当日卖出笔数">卖出</th>
+                <th class="num" title="借方：当日买入成交额">买入金额</th>
+                <th class="num" title="贷方：当日卖出成交额">卖出金额</th>
+                <th class="num" title="当日费用（实际值或按费率估算）">费用</th>
+                <th class="num" title="当日卖出按移动加权成本计算的已实现盈亏（不含费用，与持仓汇总口径一致）">当日已实现盈亏</th>
+                <th>涉及股票</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+            <tfoot></tfoot>
+          </table>
+        </div>
       </div>
     </div>
   </section>

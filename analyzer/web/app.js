@@ -59,6 +59,7 @@ const state = {
     meta: {},           // code -> {name, latest_price}
     batchRows: [],      // 批量解析结果（待导入）
     batchCode: null,    // 批量目标股票
+    statsRange: lsGet("tradesStatsRange", "month"),  // 收益统计范围: year | month | week | all
   },
   // 费用估算模型（localStorage 持久化）：佣金‱ / 每笔最低元；印花/过户为市场固定值
   feeCfg: (() => {
@@ -1763,6 +1764,129 @@ function renderTradesPage() {
       cnt.textContent = `共 ${p.trades.length} 笔 · ${Object.keys(byCode).length} 只股票 · 费用 ≈${fmtNum(totFee)}`;
     }
   }
+
+  renderTradesStats();   // 收益统计子标签与流水共用同一份数据，同步刷新
+}
+
+/* ---------- 收益统计（每日已实现盈亏，独立子标签） ---------- */
+
+/** 本地时区日期 -> "YYYY-MM-DD"。 */
+function statsFmtDate(d) {
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0")
+    + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+/** 范围起始日期（含）：本周=本周一 / 本月=1 日 / 本年=1 月 1 日；all 返回 ""。 */
+function statsRangeStart(range) {
+  const now = new Date();
+  if (range === "year") return now.getFullYear() + "-01-01";
+  if (range === "month") return statsFmtDate(new Date(now.getFullYear(), now.getMonth(), 1));
+  if (range === "week") {
+    // getDay(): 0=周日；(day+6)%7 = 距本周一的天数
+    return statsFmtDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - ((now.getDay() + 6) % 7)));
+  }
+  return "";
+}
+
+/** 逐日收益：按股票移动加权成本核算，卖出日归集已实现盈亏（与持仓汇总口径一致，不含费用）。 */
+function computeDailyStats(trades) {
+  const byCode = {};
+  for (const t of trades) (byCode[t.code] = byCode[t.code] || []).push(t);
+  const days = {};   // date -> {date, realized, buyAmt, sellAmt, fee, nBuy, nSell, codes}
+  const day = (d) => days[d] || (days[d] = { date: d, realized: 0, buyAmt: 0, sellAmt: 0, fee: 0, nBuy: 0, nSell: 0, codes: {} });
+  for (const code of Object.keys(byCode)) {
+    const list = byCode[code].slice().sort((a, b) => (a.date + a.created < b.date + b.created ? -1 : 1));
+    let held = 0, avg = 0;
+    for (const t of list) {
+      const amt = t.price * t.shares;
+      const d = day(t.date);
+      d.fee += tradeFee(t);
+      d.codes[code] = (d.codes[code] || 0) + 1;
+      if (t.side === "buy") {
+        avg = (avg * held + amt) / (held + t.shares);
+        held += t.shares;
+        d.buyAmt += amt;
+        d.nBuy++;
+      } else {
+        d.realized += (t.price - avg) * Math.min(t.shares, held);
+        held = Math.max(0, held - t.shares);
+        d.sellAmt += amt;
+        d.nSell++;
+      }
+    }
+  }
+  return Object.values(days).sort((a, b) => (a.date < b.date ? 1 : -1));
+}
+
+function renderTradesStats() {
+  const tb = $("#stats-table tbody");
+  const tf = $("#stats-table tfoot");
+  if (!tb) return;
+  const p = state.tradesPage;
+  const daily = computeDailyStats(p.trades);
+  // 摘要：三个维度一把尺（已实现盈亏，不含费用）
+  const sumRealized = (start) =>
+    daily.reduce((s, d) => (!start || d.date >= start ? s + d.realized : s), 0);
+  const sm = $("#stats-summary");
+  if (sm) {
+    if (!p.trades.length) sm.textContent = "";
+    else {
+      const chip = (label, v) => `${label} <b class="${pctCls(v)}">${fmtSignedNum(v)}</b>`;
+      sm.innerHTML = chip("本周", sumRealized(statsRangeStart("week")))
+        + " · " + chip("本月", sumRealized(statsRangeStart("month")))
+        + " · " + chip("本年", sumRealized(statsRangeStart("year")))
+        + "（已实现，不含费用）";
+    }
+  }
+  const start = statsRangeStart(p.statsRange);
+  const rows = daily.filter((d) => !start || d.date >= start);
+  tb.innerHTML = rows.length
+    ? rows.map((d) => {
+        const codes = Object.keys(d.codes);
+        const shown = codes.slice(0, 6).map((c) => {
+          const name = (p.meta[c] || {}).name || c;
+          return `<span class="tag-wl" data-code="${c}" title="${c} · 点击跳转个股" style="cursor:pointer">${escHtml(name)}</span>`;
+        }).join(" ");
+        return `
+      <tr>
+        <td>${d.date}</td>
+        <td class="num">${d.nBuy || "—"}</td>
+        <td class="num">${d.nSell || "—"}</td>
+        <td class="num">${d.buyAmt ? fmtNum(d.buyAmt) : "—"}</td>
+        <td class="num">${d.sellAmt ? fmtNum(d.sellAmt) : "—"}</td>
+        <td class="num" style="color:var(--text-dim)">${fmtNum(d.fee)}</td>
+        <td class="num ${pctCls(d.realized)}" style="font-weight:600">${fmtSignedNum(d.realized)}</td>
+        <td>${shown}${codes.length > 6 ? ` <span class="hint">等 ${codes.length} 只</span>` : ""}</td>
+      </tr>`;
+      }).join("")
+    : `<tr><td colspan="8" class="hint" style="padding:12px">该范围内暂无交易记录</td></tr>`;
+  tb.querySelectorAll("[data-code]").forEach((el) =>
+    el.addEventListener("click", () => { switchTab("stock"); pickStock(el.dataset.code); })
+  );
+  if (tf) {
+    if (!rows.length) tf.innerHTML = "";
+    else {
+      let buy = 0, sell = 0, fee = 0, realized = 0, nB = 0, nS = 0;
+      for (const d of rows) { buy += d.buyAmt; sell += d.sellAmt; fee += d.fee; realized += d.realized; nB += d.nBuy; nS += d.nSell; }
+      tf.innerHTML = `<tr>
+        <td style="text-align:left;font-weight:600">合计 · ${rows.length} 个交易日</td>
+        <td class="num">${nB}</td>
+        <td class="num">${nS}</td>
+        <td class="num">${fmtNum(buy)}</td>
+        <td class="num">${fmtNum(sell)}</td>
+        <td class="num">${fmtNum(fee)}</td>
+        <td class="num ${pctCls(realized)}" style="font-weight:600">${fmtSignedNum(realized)}</td>
+        <td></td>
+      </tr>`;
+    }
+  }
+}
+
+/** 交易记录页子标签切换（交易流水 / 收益统计）。 */
+function switchTradesSub(tt) {
+  $$("#trades-subtabs .tt-subtab").forEach((b) => b.classList.toggle("active", b.dataset.tt === tt));
+  $$("#tab-trades .tt-subpanel").forEach((p) => p.classList.toggle("active", p.dataset.ttPanel === tt));
+  if (tt === "stats") renderTradesStats();
 }
 
 function setTradesFormSide(side) {
@@ -4345,6 +4469,21 @@ async function bootstrap() {
   };
   $("#fee-comm").addEventListener("input", onFeeCfg);
   $("#fee-min").addEventListener("input", onFeeCfg);
+
+  // 交易记录页子标签（交易流水 / 收益统计）+ 收益统计范围切换（localStorage 记忆）
+  $$("#trades-subtabs .tt-subtab").forEach((b) =>
+    b.addEventListener("click", () => switchTradesSub(b.dataset.tt))
+  );
+  $("#stats-range").querySelectorAll("button").forEach((b) => {
+    if (b.dataset.range === state.tradesPage.statsRange) b.classList.add("active");
+    b.addEventListener("click", () => {
+      $("#stats-range").querySelectorAll("button").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      state.tradesPage.statsRange = b.dataset.range;
+      lsSet("tradesStatsRange", b.dataset.range);
+      renderTradesStats();
+    });
+  });
   bindTradesFormStock();
   $("#trades-form-box").addEventListener("keydown", (e) => {
     if (e.key === "Escape") hideTradesForm();

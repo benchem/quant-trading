@@ -70,6 +70,21 @@ main { padding: 16px 22px 30px; max-width: 1400px; margin: 0 auto; }
 .subtab .dot.up { display: inline-block; background: var(--up); }
 .subtab .dot.down { display: inline-block; background: var(--down); }
 
+/* 交易记录页子标签（交易流水 / 收益统计）：与个股分析的 .subtab 分离，互不影响 */
+.tt-subtabs {
+  display: flex; gap: 2px; flex-wrap: wrap;
+  margin: 2px 0 14px; border-bottom: 1px solid var(--border);
+}
+.tt-subtab {
+  background: none; border: none; color: var(--text-dim);
+  font-size: 13px; padding: 7px 13px; cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.tt-subtab:hover { color: var(--text); }
+.tt-subtab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
+.tt-subpanel { display: none; }
+.tt-subpanel.active { display: block; }
+
 /* ---------- 弹窗（日K线 -> 当日分时） ---------- */
 .modal { position: fixed; inset: 0; z-index: 100; display: none; }
 .modal.open { display: block; }

@@ -710,18 +710,18 @@
           <button data-mode="realized">已实现盈亏</button>
           <button data-mode="floating">浮动盈亏</button>
         </div>
-        <span class="toolbar-label">范围</span>
-        <div class="btn-group" id="stats-range">
-          <button data-range="year">本年</button>
-          <button data-range="month">本月</button>
-          <button data-range="week">本周</button>
-          <button data-range="all">全部</button>
+        <span class="toolbar-label">粒度</span>
+        <div class="btn-group" id="stats-gran">
+          <button data-gran="day">按日</button>
+          <button data-gran="week">按周</button>
+          <button data-gran="month">按月</button>
+          <button data-gran="year">按年</button>
         </div>
         <span class="hint" id="stats-summary" style="margin:0"></span>
       </div>
 
       <div class="chart-box" id="pnl-chart-box" style="display:none">
-        <div class="chart-title">每日浮动盈亏走势（持仓市值 − 持仓成本，按各股日线后复权×真实价锚折算 · 停牌日沿用最近收盘）</div>
+        <div class="chart-title" id="stats-chart-title">每日浮动盈亏走势（持仓市值 − 持仓成本，按各股日线后复权×真实价锚折算 · 停牌日沿用最近收盘）</div>
         <div id="stats-pnl-chart" style="height:300px"></div>
       </div>
 

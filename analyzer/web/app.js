@@ -59,7 +59,7 @@ const state = {
     meta: {},           // code -> {name, latest_price}
     batchRows: [],      // 批量解析结果（待导入）
     batchCode: null,    // 批量目标股票
-    statsRange: lsGet("tradesStatsRange", "month"),  // 收益统计范围: year | month | week | all
+    statsGran: lsGet("tradesStatsGran", "day"),  // 收益统计粒度: day | week | month | year（期间汇总，非范围过滤）
     statsMode: lsGet("tradesStatsMode", "realized"), // 收益统计口径: realized | floating
     klines: {},         // code -> {dates[], close[], name}（浮动盈亏用，按需拉取）
     klinesLoading: false,
@@ -1792,6 +1792,54 @@ function statsRangeStart(range) {
   return "";
 }
 
+/** 收益统计期间键：date 归属到 日 / 周（周一的日期为键）/ 月 / 年。 */
+function statsPeriodKey(date, gran) {
+  if (gran === "year") return date.slice(0, 4);
+  if (gran === "month") return date.slice(0, 7);
+  if (gran === "week") {
+    const [y, m, d] = date.split("-").map(Number);
+    return statsFmtDate(new Date(y, m - 1, d - ((new Date(y, m - 1, d).getDay() + 6) % 7)));
+  }
+  return date;
+}
+
+/** 期间键展示文案：日=YYYY-MM-DD，周=MM/DD ~ MM/DD，月=YYYY年M月，年=YYYY年。 */
+function statsPeriodLabel(key, gran) {
+  if (gran === "year") return key + "年";
+  if (gran === "month") return key.replace("-", "年") + "月";
+  if (gran === "week") {
+    const [y, m, d] = key.split("-").map(Number);
+    return key.slice(5).replace("-", "/") + " ~ " + statsFmtDate(new Date(y, m - 1, d + 6)).slice(5).replace("-", "/");
+  }
+  return key;
+}
+
+const STATS_GRAN_NAME = { day: "每日", week: "每周", month: "每月", year: "每年" };
+
+/** 收益统计表头随口径/粒度变化：日=当日口径，周/月/年=期间汇总口径。 */
+function statsThead(mode, gran) {
+  const th = (t, tip) => `<th class="num" title="${tip}">${t}</th>`;
+  if (mode === "realized") {
+    const u = gran === "day" ? "当日" : "期间";
+    $("#stats-table thead").innerHTML = `<th>期间</th>`
+      + th(u + "买入", u + "买入笔数") + th(u + "卖出", u + "卖出笔数")
+      + th("买入金额", "借方：买入成交额合计") + th("卖出金额", "贷方：卖出成交额合计")
+      + th("费用", u + "费用合计（实际值或按费率估算）")
+      + th(u + "已实现盈亏", "卖出按移动加权成本核算的已实现盈亏合计（不含费用，与持仓汇总口径一致）")
+      + `<th>涉及股票</th>`;
+  } else {
+    const e = gran === "day" ? "" : "期末";
+    const u = gran === "day" ? "当日" : "当期";
+    $("#stats-float-table thead").innerHTML = `<th>期间</th>`
+      + th(e + "持仓只数", "期末收盘仍有持仓的股票只数")
+      + th(e + "持仓市值", "Σ 收盘价×持仓股数（真实价口径）")
+      + th(e + "持仓成本", "Σ 移动加权成本×持仓股数（不含费用，与持仓汇总口径一致）")
+      + th(e + "浮动盈亏", "持仓市值 − 持仓成本")
+      + th(u + "变动", u + "内浮动盈亏变动（含买卖带来的仓变化）")
+      + th(u + "已实现", u + "内卖出已实现盈亏合计");
+  }
+}
+
 /** 逐日收益：按股票移动加权成本核算，卖出日归集已实现盈亏（与持仓汇总口径一致，不含费用）。 */
 function computeDailyStats(trades) {
   const byCode = {};
@@ -1828,6 +1876,10 @@ async function renderTradesStats() {
   if (!tb) return;
   const p = state.tradesPage;
   const daily = computeDailyStats(p.trades);
+  const gran = p.statsGran || "day";
+  const gn = STATS_GRAN_NAME[gran] || "每日";
+  statsThead("realized", gran);
+  statsThead("floating", gran);
   // 摘要：三个维度一把尺（已实现盈亏，不含费用）
   const sumRealized = (start) =>
     daily.reduce((s, d) => (!start || d.date >= start ? s + d.realized : s), 0);
@@ -1849,8 +1901,14 @@ async function renderTradesStats() {
   $("#stats-float-table").style.display = floating ? "" : "none";
   $("#pnl-chart-box").style.display = floating ? "" : "none";
   $("#stats-table-title").textContent = floating
-    ? "每日浮动盈亏（持仓市值 − 持仓成本 · 收盘价折算 · 当日变动含买卖带来的仓变化）"
-    : "每日收益（已实现盈亏按移动加权成本逐笔核算，归集到卖出日 · 买入日无已实现收益 · 点击股票跳转个股）";
+    ? (gran === "day"
+      ? "每日浮动盈亏（持仓市值 − 持仓成本 · 收盘价折算 · 当日变动含买卖带来的仓变化）"
+      : gn + "浮动盈亏汇总（期末快照 · 当期变动含买卖带来的仓变化）")
+    : (gran === "day"
+      ? "每日收益（已实现盈亏按移动加权成本逐笔核算，归集到卖出日 · 买入日无已实现收益 · 点击股票跳转个股）"
+      : gn + "收益汇总（已实现盈亏 · 移动加权成本口径 · 不含费用 · 点击股票跳转个股）");
+  const ct = $("#stats-chart-title");
+  if (ct) ct.textContent = gn + "浮动盈亏走势（持仓市值 − 持仓成本，按各股日线后复权×真实价锚折算 · 停牌日沿用最近收盘）";
   if (floating) {
     const need = [...new Set(p.trades.map((t) => t.code))].filter((c) => !(c in p.klines));
     if (need.length) {
@@ -1867,38 +1925,48 @@ async function renderTradesStats() {
     return;
   }
 
-  const start = statsRangeStart(p.statsRange);
-  const rows = daily.filter((d) => !start || d.date >= start);
+  // 期间汇总（非范围过滤）：每个 日/周/月/年 一行，聚合当日明细
+  const groups = new Map();
+  for (const d of daily) {
+    const key = statsPeriodKey(d.date, gran);
+    let g = groups.get(key);
+    if (!g) groups.set(key, g = { key, days: 0, nBuy: 0, nSell: 0, buyAmt: 0, sellAmt: 0, fee: 0, realized: 0, codes: {} });
+    g.days++; g.nBuy += d.nBuy; g.nSell += d.nSell;
+    g.buyAmt += d.buyAmt; g.sellAmt += d.sellAmt; g.fee += d.fee; g.realized += d.realized;
+    Object.assign(g.codes, d.codes);
+  }
+  const rows = [...groups.values()].sort((a, b) => (a.key < b.key ? 1 : -1));
+  const codeTags = (codesObj) => {
+    const codes = Object.keys(codesObj);
+    const shown = codes.slice(0, 6).map((c) => {
+      const name = (p.meta[c] || {}).name || c;
+      return `<span class="tag-wl" data-code="${c}" title="${c} · 点击跳转个股" style="cursor:pointer">${escHtml(name)}</span>`;
+    }).join(" ");
+    return shown + (codes.length > 6 ? ` <span class="hint">等 ${codes.length} 只</span>` : "");
+  };
   tb.innerHTML = rows.length
-    ? rows.map((d) => {
-        const codes = Object.keys(d.codes);
-        const shown = codes.slice(0, 6).map((c) => {
-          const name = (p.meta[c] || {}).name || c;
-          return `<span class="tag-wl" data-code="${c}" title="${c} · 点击跳转个股" style="cursor:pointer">${escHtml(name)}</span>`;
-        }).join(" ");
-        return `
+    ? rows.map((g) => `
       <tr>
-        <td>${d.date}</td>
-        <td class="num">${d.nBuy || "—"}</td>
-        <td class="num">${d.nSell || "—"}</td>
-        <td class="num">${d.buyAmt ? fmtNum(d.buyAmt) : "—"}</td>
-        <td class="num">${d.sellAmt ? fmtNum(d.sellAmt) : "—"}</td>
-        <td class="num" style="color:var(--text-dim)">${fmtNum(d.fee)}</td>
-        <td class="num ${pctCls(d.realized)}" style="font-weight:600">${fmtSignedNum(d.realized)}</td>
-        <td>${shown}${codes.length > 6 ? ` <span class="hint">等 ${codes.length} 只</span>` : ""}</td>
-      </tr>`;
-      }).join("")
-    : `<tr><td colspan="8" class="hint" style="padding:12px">该范围内暂无交易记录</td></tr>`;
+        <td>${statsPeriodLabel(g.key, gran)}</td>
+        <td class="num">${g.nBuy || "—"}</td>
+        <td class="num">${g.nSell || "—"}</td>
+        <td class="num">${g.buyAmt ? fmtNum(g.buyAmt) : "—"}</td>
+        <td class="num">${g.sellAmt ? fmtNum(g.sellAmt) : "—"}</td>
+        <td class="num" style="color:var(--text-dim)">${fmtNum(g.fee)}</td>
+        <td class="num ${pctCls(g.realized)}" style="font-weight:600">${fmtSignedNum(g.realized)}</td>
+        <td>${codeTags(g.codes)}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="8" class="hint" style="padding:12px">暂无交易记录</td></tr>`;
   tb.querySelectorAll("[data-code]").forEach((el) =>
     el.addEventListener("click", () => { switchTab("stock"); pickStock(el.dataset.code); })
   );
   if (tf) {
     if (!rows.length) tf.innerHTML = "";
     else {
-      let buy = 0, sell = 0, fee = 0, realized = 0, nB = 0, nS = 0;
-      for (const d of rows) { buy += d.buyAmt; sell += d.sellAmt; fee += d.fee; realized += d.realized; nB += d.nBuy; nS += d.nSell; }
+      let buy = 0, sell = 0, fee = 0, realized = 0, nB = 0, nS = 0, days = 0;
+      for (const g of rows) { buy += g.buyAmt; sell += g.sellAmt; fee += g.fee; realized += g.realized; nB += g.nBuy; nS += g.nSell; days += g.days; }
       tf.innerHTML = `<tr>
-        <td style="text-align:left;font-weight:600">合计 · ${rows.length} 个交易日</td>
+        <td style="text-align:left;font-weight:600">合计 · ${days} 个交易日</td>
         <td class="num">${nB}</td>
         <td class="num">${nS}</td>
         <td class="num">${fmtNum(buy)}</td>
@@ -1979,11 +2047,33 @@ function renderTradesStatsFloat(daily) {
   const p = state.tradesPage;
   const tb = $("#stats-float-table tbody");
   const tf = $("#stats-float-table tfoot");
+  const gran = p.statsGran || "day";
   const realizedByDate = {};
   for (const d of daily) realizedByDate[d.date] = d.realized;
   const series = computeFloatingSeries(p.trades, p.klines, realizedByDate);
-  const start = statsRangeStart(p.statsRange);
-  const rows = series.filter((d) => !start || d.date >= start);
+  // 期间汇总（非范围过滤）：日粒度剔除无持仓无变动的空闲日；周/月/年聚合为期末快照 + 当期变动
+  let rows;
+  if (gran === "day") {
+    rows = series
+      .filter((d) => d.nPos > 0 || d.change !== 0 || d.realized !== 0)
+      .map((d) => ({ label: d.date, nPos: d.nPos, mv: d.mv, cost: d.cost, floating: d.floating, change: d.change, realized: d.realized, cumTotal: d.cumTotal }));
+  } else {
+    const groups = new Map();
+    for (const d of series) {
+      const key = statsPeriodKey(d.date, gran);
+      let g = groups.get(key);
+      if (!g) groups.set(key, g = { key, days: 0, first: d, last: d, realized: 0 });
+      g.days++; g.last = d; g.realized += d.realized;
+    }
+    rows = [...groups.values()]
+      .filter((g) => g.last.nPos > 0 || g.realized !== 0 || g.last.change !== 0 || g.first.change !== 0)
+      .map((g) => ({
+        label: statsPeriodLabel(g.key, gran),
+        nPos: g.last.nPos, mv: g.last.mv, cost: g.last.cost, floating: g.last.floating,
+        change: g.last.floating - (g.first.floating - g.first.change),  // 当期变动 = 期末 − 期初
+        realized: g.realized, cumTotal: g.last.cumTotal, days: g.days,
+      }));
+  }
   const last = rows.length ? rows[rows.length - 1] : null;
   const sm = $("#stats-summary");
   if (sm) {
@@ -1997,35 +2087,47 @@ function renderTradesStatsFloat(daily) {
     }
   }
   tb.innerHTML = rows.length
-    ? rows.slice().reverse().map((d) => `
+    ? rows.slice().reverse().map((r) => `
       <tr>
-        <td>${d.date}</td>
-        <td class="num">${d.nPos || "—"}</td>
-        <td class="num">${d.mv ? fmtNum(d.mv) : "—"}</td>
-        <td class="num" style="color:var(--text-dim)">${d.cost ? fmtNum(d.cost) : "—"}</td>
-        <td class="num ${pctCls(d.floating)}" style="font-weight:600">${fmtSignedNum(d.floating)}</td>
-        <td class="num ${pctCls(d.change)}">${fmtSignedNum(d.change)}</td>
-        <td class="num ${d.realized ? pctCls(d.realized) : ""}" style="color:var(--text-dim)">${d.realized ? fmtSignedNum(d.realized) : "—"}</td>
+        <td>${r.label}</td>
+        <td class="num">${r.nPos || "—"}</td>
+        <td class="num">${r.mv ? fmtNum(r.mv) : "—"}</td>
+        <td class="num" style="color:var(--text-dim)">${r.cost ? fmtNum(r.cost) : "—"}</td>
+        <td class="num ${pctCls(r.floating)}" style="font-weight:600">${fmtSignedNum(r.floating)}</td>
+        <td class="num ${pctCls(r.change)}">${fmtSignedNum(r.change)}</td>
+        <td class="num ${r.realized ? pctCls(r.realized) : ""}" style="color:var(--text-dim)">${r.realized ? fmtSignedNum(r.realized) : "—"}</td>
       </tr>`).join("")
-    : `<tr><td colspan="7" class="hint" style="padding:12px">该范围内暂无交易记录</td></tr>`;
+    : `<tr><td colspan="7" class="hint" style="padding:12px">暂无交易记录</td></tr>`;
   if (tf) {
     if (!last) tf.innerHTML = "";
-    else {
-      const periodChange = last.floating - (rows.length ? rows[0].floating - rows[0].change : 0);
+    else if (gran === "day") {
       tf.innerHTML = `<tr>
-        <td style="text-align:left;font-weight:600">期末（${last.date}）· ${rows.length} 个交易日</td>
+        <td style="text-align:left;font-weight:600">期末（${last.label}）· ${rows.length} 个交易日</td>
         <td class="num">${last.nPos || "—"}</td>
         <td class="num">${fmtNum(last.mv)}</td>
         <td class="num">${fmtNum(last.cost)}</td>
         <td class="num ${pctCls(last.floating)}" style="font-weight:600">${fmtSignedNum(last.floating)}</td>
-        <td class="num ${pctCls(periodChange)}" title="范围内浮动盈亏变化 = 期末 − 期初前一日">${fmtSignedNum(periodChange)}</td>
+        <td class="num ${pctCls(last.change)}" title="当日浮动盈亏变动">${fmtSignedNum(last.change)}</td>
         <td class="num"></td>
+      </tr>`;
+    } else {
+      const totChange = rows.reduce((s, r) => s + r.change, 0);
+      const totRealized = rows.reduce((s, r) => s + r.realized, 0);
+      const totDays = rows.reduce((s, r) => s + (r.days || 0), 0);
+      tf.innerHTML = `<tr>
+        <td style="text-align:left;font-weight:600">合计 · ${totDays} 个交易日</td>
+        <td class="num">${last.nPos || "—"}</td>
+        <td class="num">${fmtNum(last.mv)}</td>
+        <td class="num">${fmtNum(last.cost)}</td>
+        <td class="num ${pctCls(last.floating)}" style="font-weight:600">${fmtSignedNum(last.floating)}</td>
+        <td class="num ${pctCls(totChange)}" title="各期间变动之和 = 期末 − 期初">${fmtSignedNum(totChange)}</td>
+        <td class="num ${totRealized ? pctCls(totRealized) : ""}" style="color:var(--text-dim)">${totRealized ? fmtSignedNum(totRealized) : "—"}</td>
       </tr>`;
     }
   }
-  // 折线图：浮动盈亏 + 总收益（浮动 + 累计已实现）
+  // 折线图：浮动盈亏 + 总收益（浮动 + 累计已实现）；粒度非日时取各期间期末点
   const box = $("#pnl-chart-box");
-  if (box && box.style.display !== "none" && series.length) {
+  if (box && box.style.display !== "none" && rows.length) {
     const c = mkChart("stats-pnl-chart");
     c.setOption({
       tooltip: {
@@ -2034,7 +2136,7 @@ function renderTradesStatsFloat(daily) {
       },
       legend: { top: 0, textStyle: { color: "#8b98ab", fontSize: 11 }, itemWidth: 14 },
       grid: { left: 64, right: 18, top: 34, bottom: 48 },
-      xAxis: { type: "category", data: series.map((d) => d.date), ...AXIS },
+      xAxis: { type: "category", data: rows.map((r) => r.label), ...AXIS },
       yAxis: {
         type: "value", ...AXIS,
         axisLabel: { ...AXIS.axisLabel, formatter: (v) => fmtNum(v, 0) },
@@ -2043,7 +2145,7 @@ function renderTradesStatsFloat(daily) {
       dataZoom: [{ type: "inside" }, { type: "slider", height: 14, bottom: 10, borderColor: "#2a3342", backgroundColor: "#161b24", fillerColor: "rgba(79,142,247,.2)", textStyle: { color: "#8b98ab" } }],
       series: [
         {
-          name: "浮动盈亏", type: "line", data: series.map((d) => +d.floating.toFixed(2)),
+          name: "浮动盈亏", type: "line", data: rows.map((r) => +r.floating.toFixed(2)),
           showSymbol: false, lineStyle: { width: 1.8 }, itemStyle: { color: "#4f8ef7" },
           areaStyle: { color: "rgba(79,142,247,.12)" }, emphasis: { focus: "series" },
           markLine: {
@@ -2053,7 +2155,7 @@ function renderTradesStatsFloat(daily) {
           },
         },
         {
-          name: "总收益（浮+累计已实现）", type: "line", data: series.map((d) => +d.cumTotal.toFixed(2)),
+          name: "总收益（浮+累计已实现）", type: "line", data: rows.map((r) => +r.cumTotal.toFixed(2)),
           showSymbol: false, lineStyle: { width: 1.6, type: "dashed" }, itemStyle: { color: "#e6a23c" },
           emphasis: { focus: "series" },
         },
@@ -4665,13 +4767,13 @@ async function bootstrap() {
       renderTradesStats();
     });
   });
-  $("#stats-range").querySelectorAll("button").forEach((b) => {
-    if (b.dataset.range === state.tradesPage.statsRange) b.classList.add("active");
+  $("#stats-gran").querySelectorAll("button").forEach((b) => {
+    if (b.dataset.gran === state.tradesPage.statsGran) b.classList.add("active");
     b.addEventListener("click", () => {
-      $("#stats-range").querySelectorAll("button").forEach((x) => x.classList.remove("active"));
+      $("#stats-gran").querySelectorAll("button").forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
-      state.tradesPage.statsRange = b.dataset.range;
-      lsSet("tradesStatsRange", b.dataset.range);
+      state.tradesPage.statsGran = b.dataset.gran;
+      lsSet("tradesStatsGran", b.dataset.gran);
       renderTradesStats();
     });
   });

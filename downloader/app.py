@@ -683,9 +683,47 @@ class Downloader:
 
     def refresh_trade_calendar(self) -> pd.Series:
         dates = with_retry(source.fetch_trade_dates, desc="交易日历")
+        dates = self._calendar_cross_check(dates)
         store.save_parquet(store.trade_cal_path(self.data_dir), pd.DataFrame({"trade_date": dates}))
-        _log(f"交易日历已刷新: {len(dates)} 天")
+        _log(f"交易日历已刷新: {len(dates)} 天（至 {dates.max().date()}）")
         return dates
+
+    def _calendar_cross_check(self, dates: pd.Series) -> pd.Series:
+        """日历 × 上证指数行情 quote_time 交叉校验（2026-11-04 事故）。
+
+        事故链：15:31 日历源（EM 指数K线）滞后未发布当日 -> trade_calendar
+        max 停在前一交易日 -> analyzer._snapshot_date 把当日快照钳到前日
+        -> price_info 以前收外推，300199 错显 24.32（真收 22.71），全市场
+        5,087 只同错。日历与行情源相互独立（qt.gtimg.cn 实时接口），行情
+        所属日 > 日历 max 即日历滞后。处置：非周末自动补行（周末休市误报
+        免疫），并写 _log 告警留痕；行情拉取失败仅告警不改数据（当日坏
+        bar 另有量指纹守卫 verify_daily_vintage 把关）。
+        """
+        try:
+            q = source.fetch_gtimg_quotes(["000001.SH"])
+            qt = (q.get("000001.SH") or {}).get("quote_time") or ""
+            quote_day = pd.Timestamp(str(qt)[:8]).normalize() if len(qt) >= 8 else None
+        except Exception as e:  # noqa: BLE001 行情失败不阻塞日历落盘
+            _log(f"警告: 日历交叉校验行情失败（不阻塞）: {e}")
+            return dates
+        if quote_day is None or quote_day is pd.NaT:
+            _log("警告: 日历交叉校验无行情时间（不阻塞）")
+            return dates
+        dates = pd.Series(pd.to_datetime(dates)).sort_values().reset_index(drop=True)
+        cal_max = dates.max()
+        if quote_day <= cal_max:
+            return dates  # 日历不滞后
+        if quote_day.weekday() >= 5:
+            _log(f"日历交叉校验: 行情日 {quote_day.date()} 为周末（休市），不补行")
+            return dates
+        missing = pd.date_range(cal_max + pd.Timedelta(days=1), quote_day)
+        missing = pd.Series([d for d in missing if d.weekday() < 5])
+        if not len(missing):
+            return dates
+        _log(f"日历交叉校验: 日历止于 {cal_max.date()}，行情日 {quote_day.date()} "
+             f"-> 自动补 {len(missing)} 个交易日: "
+             f"{', '.join(str(d.date()) for d in missing)}（日历源当日未发布）")
+        return pd.concat([dates, missing], ignore_index=True).sort_values().reset_index(drop=True)
 
     def last_trade_date(self, refresh: bool = False) -> Optional[pd.Timestamp]:
         p = store.trade_cal_path(self.data_dir)

@@ -3848,12 +3848,17 @@ async function loadBoardRank() {
 function renderFlow(d) {
   const items = d.items || [];
   const hint = $("#flow-hint"), status = $("#flow-status");
-  if (!items.length) { hint.textContent = "无资金流数据"; return; }
+  if (!items.length) {
+    hint.textContent = "无资金流数据";
+    if (charts["chart-flow"]) { charts["chart-flow"].dispose(); delete charts["chart-flow"]; }
+    $("#chart-flow").innerHTML = "";
+    return;
+  }
   if (d.stale && status) status.textContent = "（网络异常，显示旧缓存）";
   const c = mkChart("chart-flow");
   const days = items.map((x) => x.day);
   const main = items.map((x) => (x.main_net != null ? x.main_net / 1e8 : null));
-  const big = items.map((x) => (x.big_net != null ? x.big_net / 1e8 : null));
+  const sup = items.map((x) => (x.super_net != null ? x.super_net / 1e8 : null));
   c.setOption({
     backgroundColor: "transparent",
     tooltip: { trigger: "axis", axisPointer: { type: "cross" },
@@ -3868,10 +3873,11 @@ function renderFlow(d) {
     series: [
       { name: "主力净流入(亿)", type: "bar", data: main,
         itemStyle: { color: (p) => (p.value >= 0 ? UP : DOWN) } },
-      { name: "超大单(亿)", type: "bar", data: big, barGap: "-100%", opacity: .45,
+      { name: "超大单(亿)", type: "bar", data: sup, barGap: "-100%", opacity: .45,
         itemStyle: { color: (p) => (p.value >= 0 ? UP : DOWN) } },
       { name: "收盘价", type: "line", yAxisIndex: 1, data: items.map((x) => x.close),
-        showSymbol: false, lineStyle: { color: ACCENT, width: 1.2 } },
+        showSymbol: false, lineStyle: { color: ACCENT, width: 1.2 },
+        tooltip: { valueFormatter: (v) => (v == null ? "-" : v.toFixed(2) + " 元") } },
     ],
   });
   hint.textContent = `近 ${items.length} 日：最近一日主力净流入 ${

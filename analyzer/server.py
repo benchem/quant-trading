@@ -597,6 +597,26 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                         return self._json({"error": "未找到该任务（可能已被清理，"
                                                     "请重新提交）"}, 404)
                     self._json(out)
+                elif path == "/api/agent/strategies":
+                    # 问股 Agent 策略清单（strategies/*.yaml，DSA 15 个）
+                    from .agent.chat import load_strategies
+                    out = [{"name": name,
+                            "display_name": s.get("display_name"),
+                            "description": (s.get("description") or "")[:120]}
+                           for name, s in load_strategies().items()]
+                    self._json({"strategies": out, "count": len(out)})
+                elif path == "/api/agent/chat/session":
+                    # 问股会话历史（?session_id=；缺省开新会话返回空）
+                    from .agent.chat import ChatSession, _session_path
+                    sid = params.get("session_id") or ""
+                    if sid and not re.fullmatch(r"[0-9a-zA-Z_-]{1,32}", sid):
+                        return self._json({"error": "session_id 非法"}, 400)
+                    sess = ChatSession(_session_path(store.root, user, sid or "default"))
+                    data = sess.load()
+                    self._json({"session_id": data["id"],
+                                "messages": data["messages"][-40:],
+                                "active_code": data.get("active_code"),
+                                "strategy": data.get("strategy")})
                 elif path == "/api/update/status":
                     if updater is None:
                         return self._json({"error": "盘后自动更新未启用"}, 503)
@@ -789,6 +809,42 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                 return self._json({"error": "AI 分析提交失败"}, 500)
             # 缓存命中：out 为完整报告 payload -> 保持同步 200；否则为 job 信息 -> 202
             self._json(out, 200 if out.get("report") is not None else 202)
+
+        def _post_agent_chat(self, user: str | None):
+            """问股 Agent：多轮会话 + 策略注入 + 本地工具 ReAct 循环（≤6 步 / 90s）。
+
+            body: {message, session_id?, strategy?}；同步返回（ThreadingHTTPServer
+            不阻塞其他请求）。会话/持仓按 user 隔离。
+            """
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b"{}"
+                req = json.loads(body.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                return self._json({"error": "请求体应为 JSON"}, 400)
+            message = str(req.get("message") or "").strip()
+            if not message:
+                return self._json({"error": "message 不能为空"}, 400)
+            if len(message) > 2000:
+                return self._json({"error": "message 过长（>2000 字符）"}, 400)
+            session_id = req.get("session_id") or None
+            if session_id and not re.fullmatch(r"[0-9a-zA-Z_-]{1,32}", session_id):
+                return self._json({"error": "session_id 非法"}, 400)
+            strategy = req.get("strategy")
+            if strategy is not None:
+                strategy = str(strategy)[:60] or None
+            from .agent import AIConfig, AIError
+            from .agent.chat import run_chat_turn
+
+            try:
+                out = run_chat_turn(store, user, session_id, message,
+                                    strategy=strategy, config=AIConfig.from_env())
+            except AIError as e:
+                return self._json({"error": str(e)}, e.status)
+            except Exception:
+                traceback.print_exc()
+                return self._json({"error": "问股失败（服务端异常，详见日志）"}, 500)
+            self._json(out)
 
         def _post_watchlist(self, user: str | None):
             try:
@@ -1033,6 +1089,8 @@ def make_handler(store: DataStore, runner=None, syncer=None, notifier=None, upda
                 return self._post_notifications(user)
             if path == "/api/journal":
                 return self._post_journal(user)
+            if path == "/api/agent/chat":
+                return self._post_agent_chat(user)
             self._json({"error": "unknown api"}, 404)
 
         def do_GET(self):  # noqa: N802

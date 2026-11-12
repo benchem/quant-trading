@@ -50,6 +50,7 @@ STAGES = (
     ("board", "板块成分"),
     ("dataset", "数据集合并"),
     ("reload", "缓存刷新"),
+    ("market_report", "大盘日报"),
     ("scan", "信号扫描"),
     ("journal", "交易日记"),
 )
@@ -687,6 +688,17 @@ class EodUpdater:
             except Exception as e:  # noqa: BLE001
                 self._error(f"分析缓存清理失败: {e}")
 
+        # 8b. 大盘复盘日报（纯规则版，吸收 DSA market_review；失败降级不阻塞）
+        self._stage("market_report")
+        try:
+            from .market_report import emit_market_report
+
+            path = emit_market_report(self.store, dt.date.fromisoformat(str(day)),
+                                      hub=self.notify)
+            self._merge_stats({"market_report": str(path.name)})
+        except Exception as e:  # noqa: BLE001
+            self._error(f"大盘日报生成失败: {e}")
+
         # 9. 自选股信号扫描 -> 消息提醒 + journal 事件
         self._stage("scan")
         n_sig = 0
@@ -711,6 +723,20 @@ class EodUpdater:
                 write_signal_events(self.store, hits, day)
             except Exception as e:  # noqa: BLE001 journal 旁路失败不阻塞
                 self._error(f"信号事件写入日记失败: {e}")
+
+            # 9b. 信号台账：模型意见采集 + 到期评估（吸收 DSA decision_signal）
+            try:
+                from .signals import SignalLedger
+
+                signal_ledger = SignalLedger(self.store.root)
+                n_new = signal_ledger.record_model_opinions(
+                    self.store, self.runner, codes, day,
+                    plugins=SCAN_PLUGINS, name_of=self._name_of)
+                ev = signal_ledger.evaluate_due(self.store)
+                self._merge_stats({"signals_new": n_new,
+                                   "signals_evaluated": ev.get("evaluated", 0)})
+            except Exception as e:  # noqa: BLE001 台账旁路失败不阻塞主流程
+                self._error(f"信号台账更新失败: {e}")
         with self._lock:
             self.status["signals"] = n_sig
 

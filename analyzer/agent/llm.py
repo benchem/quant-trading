@@ -46,18 +46,28 @@ class AIConfig:
         )
 
 
-def chat_completion(config: AIConfig, messages: list[dict]) -> dict:
-    """调用 OpenAI 兼容 chat/completions，返回 {content, usage}；失败抛 AIError。"""
+def chat_completion(config: AIConfig, messages: list[dict],
+                    tools: list[dict] | None = None,
+                    tool_choice: str | dict | None = None) -> dict:
+    """调用 OpenAI 兼容 chat/completions，返回 {content, tool_calls, usage}。
+
+    tools: OpenAI function-calling 工具声明（问股 Agent 用）；None 为纯文本。
+    带 tool_calls 时 content 允许为空；失败抛 AIError。
+    """
     if not config.enabled:
         raise AIError("未配置 AI_API_KEY，AI 分析不可用", 503)
+    payload: dict = {"model": config.model, "messages": messages,
+                     "temperature": 0.3, "max_tokens": config.max_tokens,
+                     "stream": False}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice or "auto"
     try:
         resp = requests.post(
             f"{config.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {config.api_key}",
                      "Content-Type": "application/json"},
-            json={"model": config.model, "messages": messages,
-                  "temperature": 0.3, "max_tokens": config.max_tokens,
-                  "stream": False},
+            json=payload,
             timeout=config.timeout,
         )
     except requests.Timeout:
@@ -78,9 +88,16 @@ def chat_completion(config: AIConfig, messages: list[dict]) -> dict:
         raise AIError(f"大模型返回错误（HTTP {resp.status_code}）: {detail}")
     try:
         data = resp.json()
-        content = (data["choices"][0]["message"]["content"] or "").strip()
+        msg = data["choices"][0]["message"]
+        content = (msg.get("content") or "").strip()
+        raw_calls = msg.get("tool_calls") or []
+        tool_calls = [{"id": c.get("id") or f"call_{i}",
+                       "name": (c.get("function") or {}).get("name") or "",
+                       "arguments": (c.get("function") or {}).get("arguments") or "{}"}
+                      for i, c in enumerate(raw_calls)]
     except (ValueError, KeyError, IndexError, TypeError):
         raise AIError("大模型响应格式异常（非 OpenAI 兼容格式）") from None
-    if not content:
+    if not content and not tool_calls:
         raise AIError("大模型返回了空内容")
-    return {"content": content, "usage": data.get("usage") or {}}
+    return {"content": content, "tool_calls": tool_calls,
+            "usage": data.get("usage") or {}}

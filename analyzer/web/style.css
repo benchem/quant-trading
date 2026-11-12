@@ -619,3 +619,31 @@ a.j-code:hover { text-decoration: underline; }
 .sim-caret { color: var(--text-dim); width: 22px; text-align: center; }
 .sim-detail-row > td { padding: 0 8px 8px 26px; background: rgba(22, 27, 36, .5); }
 .sim-detail-row .table-wrap { max-height: 300px; margin: 8px 0 0; }
+
+/* ===================== 问股 Agent ===================== */
+.agent-wrap {
+  display: flex; flex-direction: column; gap: 10px;
+  max-width: 860px; margin: 0 auto; height: calc(100vh - 190px);
+  min-height: 420px;
+}
+.agent-head { display: flex; align-items: center; gap: 10px; flex: none; }
+.agent-head select { max-width: 360px; }
+.agent-messages {
+  flex: 1; overflow-y: auto; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-panel);
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
+}
+.agent-msg { display: flex; flex-direction: column; max-width: 82%; }
+.agent-mine { align-self: flex-end; align-items: flex-end; }
+.agent-ai { align-self: flex-start; align-items: flex-start; }
+.agent-bubble {
+  padding: 8px 12px; border-radius: 12px; line-height: 1.6;
+  white-space: pre-wrap; word-break: break-word;
+}
+.agent-mine .agent-bubble { background: var(--accent); color: #fff; }
+.agent-ai .agent-bubble { background: var(--bg-card); border: 1px solid var(--border); }
+.agent-thinking .agent-bubble { color: var(--text-dim); animation: pulse 1.2s infinite; }
+.agent-meta { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
+.agent-input { display: flex; gap: 8px; flex: none; }
+.agent-input input { flex: 1; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }

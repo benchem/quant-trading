@@ -4234,6 +4234,7 @@ function switchTab(name, opts = {}) {
   if (name === "stock") loadWatchlist();
   if (name === "trades") loadTradesPage();
   if (name === "journal") loadJournal(JOURNAL.code);
+  if (name === "agent") initAgentChat();
   if (name === "inbox") loadInbox();
   if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
 }
@@ -4804,4 +4805,115 @@ async function bootstrap() {
   const initial = location.hash.replace("#", "");
   if (["stock", "market", "rank", "trades", "inbox"].includes(initial))
     switchTab(initial, { fromHash: initial === "rank" });
+}
+
+/* ===================== 问股 Agent（DSA 吸收·模块3） ===================== */
+const AGENT = { sessionId: null, strategy: "", busy: false, inited: false };
+
+function agentEsc(s) {
+  const d = document.createElement("div");
+  d.textContent = String(s == null ? "" : s);
+  return d.innerHTML;
+}
+
+async function initAgentChat() {
+  if (!AGENT.inited) {
+    AGENT.inited = true;
+    const sel = $("#agent-strategy");
+    if (sel) {
+      try {
+        const out = await api("/api/agent/strategies");
+        (out.strategies || []).forEach((s) => {
+          const o = document.createElement("option");
+          o.value = s.name;
+          o.textContent = `${s.display_name || s.name} — ${(s.description || "").slice(0, 40)}`;
+          sel.appendChild(o);
+        });
+      } catch (e) { /* 策略清单失败不阻塞会话 */ }
+      sel.addEventListener("change", () => { AGENT.strategy = sel.value; });
+    }
+    const send = () => agentSend();
+    $("#agent-send")?.addEventListener("click", send);
+    $("#agent-input")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.isComposing) send();
+    });
+    $("#agent-new")?.addEventListener("click", () => {
+      AGENT.sessionId = null;
+      $("#agent-messages").innerHTML = "";
+      agentRender({ role: "assistant",
+        content: "已开新会话。可以直接问：`300687 现在能买吗`、`换成 600519 看看`、`对比 300687 和 600519`、`我的持仓怎么样`。" });
+    });
+    // 恢复上次会话（default 会话）
+    agentLoadHistory();
+  }
+}
+
+async function agentLoadHistory() {
+  try {
+    const sid = AGENT.sessionId || "default";
+    const out = await api(`/api/agent/chat/session?session_id=${encodeURIComponent(sid)}`);
+    if (out.session_id) AGENT.sessionId = out.session_id;
+    const box = $("#agent-messages");
+    if (box && (out.messages || []).length) {
+      box.innerHTML = "";
+      (out.messages || []).forEach((m) => agentRender(m));
+      box.scrollTop = box.scrollHeight;
+    }
+    if (out.strategy) { AGENT.strategy = out.strategy; const sel = $("#agent-strategy"); if (sel) sel.value = out.strategy; }
+  } catch (e) { /* 未登录/无历史：静默 */ }
+}
+
+function agentRender(m) {
+  const box = $("#agent-messages");
+  if (!box) return;
+  const div = document.createElement("div");
+  const mine = m.role === "user";
+  div.className = "agent-msg " + (mine ? "agent-mine" : "agent-ai");
+  const meta = [];
+  if (m.strategy) meta.push(agentEsc(m.strategy));
+  if (m.steps != null) meta.push(`${m.steps} 步工具`);
+  if (m.ts) meta.push(agentEsc(String(m.ts).slice(5, 16)));
+  div.innerHTML = `<div class="agent-bubble">${agentEsc(m.content).replace(/\n/g, "<br>")}</div>` +
+    (meta.length ? `<div class="agent-meta">${meta.join(" · ")}</div>` : "");
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
+function agentSetStatus(text, busy) {
+  const el = $("#agent-status");
+  if (el) el.textContent = text || "";
+  const btn = $("#agent-send");
+  if (btn) { btn.disabled = !!busy; btn.textContent = busy ? "思考中…" : "发送"; }
+  AGENT.busy = !!busy;
+}
+
+async function agentSend() {
+  if (AGENT.busy) return;
+  const inp = $("#agent-input");
+  const msg = (inp?.value || "").trim();
+  if (!msg) return;
+  inp.value = "";
+  agentRender({ role: "user", content: msg });
+  agentSetStatus("问股 Agent 分析中（本地工具取数 + AI 推理，最长 90 秒）…", true);
+  const typing = $("#agent-messages");
+  const think = document.createElement("div");
+  think.className = "agent-msg agent-ai agent-thinking";
+  think.innerHTML = `<div class="agent-bubble">…</div>`;
+  typing.appendChild(typing);
+  try {
+    const out = await apiPost("/api/agent/chat", {
+      message: msg,
+      session_id: AGENT.sessionId || undefined,
+      strategy: AGENT.strategy || undefined,
+    });
+    think.remove();
+    if (out.session_id) AGENT.sessionId = out.session_id;
+    agentRender({ role: "assistant", content: out.reply,
+                  strategy: AGENT.strategy, steps: out.steps });
+    agentSetStatus(`${out.steps} 步工具 · ${out.elapsed}s · ${out.usage || 0} tokens`, false);
+  } catch (e) {
+    think.remove();
+    agentRender({ role: "assistant", content: `问股失败：${e.message || e}` });
+    agentSetStatus("", false);
+  }
 }

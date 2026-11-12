@@ -4899,7 +4899,7 @@ async function agentSend() {
   const think = document.createElement("div");
   think.className = "agent-msg agent-ai agent-thinking";
   think.innerHTML = `<div class="agent-bubble">…</div>`;
-  typing.appendChild(typing);
+  typing.appendChild(think);
   try {
     const out = await apiPost("/api/agent/chat", {
       message: msg,

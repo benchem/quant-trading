@@ -1054,17 +1054,31 @@ class DataStore:
 
     @staticmethod
     def position_of(ts: list[dict], last_price: float | None = None) -> dict:
-        """移动加权平均法：持仓股数 / 持仓均价 / 已实现盈亏 / 浮动盈亏。"""
+        """移动加权平均法（含费用）：持仓股数 / 持仓均价 / 已实现盈亏 / 浮动盈亏。
+
+        费用口径（2026-11-12 批复"盈亏含费、费用单独列"）：买入 fee 摊入持仓
+        均价（浮动盈亏因此含买费）；卖出 fee 从已实现盈亏中扣除。fee 实记优先；
+        缺失按默认费率估算（佣金万5无最低 + 过户费万0.1双边 + 印花税卖出
+        0.05%，与前端 estimateFee 默认 feeCfg 同模型，保证两端同口径）。
+        """
         held = 0
         avg = 0.0
         realized = 0.0
         for t in sorted(ts, key=lambda x: (x["date"], x["created"])):
             p, s = float(t["price"]), int(t["shares"])
+            raw_fee = t.get("fee")
+            if raw_fee is None:
+                amt = p * s
+                fee = amt * (5e-4 + 1e-5)          # 佣金万5 + 过户费万0.1
+                if t["side"] == "sell":
+                    fee += amt * 5e-4              # 印花税（卖出）
+            else:
+                fee = float(raw_fee or 0.0)
             if t["side"] == "buy":
-                avg = (avg * held + p * s) / (held + s)
+                avg = (avg * held + p * s + fee) / (held + s)
                 held += s
             else:
-                realized += (p - avg) * min(s, held)
+                realized += (p - avg) * min(s, held) - fee
                 held = max(0, held - s)
         unrealized = (last_price - avg) * held if (last_price is not None and held) else 0.0
         return {

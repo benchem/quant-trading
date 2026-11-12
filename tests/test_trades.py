@@ -74,10 +74,10 @@ def t_position_math():
     # 空
     p = pos_of([], 10.0)
     assert p["held"] == 0 and p["avg_cost"] is None and p["n_trades"] == 0, p
-    # 单笔买入
+    # 单笔买入（fee 缺失按默认费率估算：1000 元 → 佣金/过户 0.5100，摊入均价）
     p = pos_of([{"date": "2026-10-20", "created": "a", "side": "buy", "price": 10.0, "shares": 100}], 11.0)
-    assert p["held"] == 100 and p["avg_cost"] == 10.0 and p["unrealized"] == 100.0, p
-    # 加仓摊薄/抬升均价
+    assert p["held"] == 100 and abs(p["avg_cost"] - 10.0051) < 1e-9 and abs(p["unrealized"] - 99.49) < 1e-9, p
+    # 加仓摊薄/抬升均价（fee 缺失按默认费率估算摊入）
     p = pos_of(
         [
             {"date": "2026-10-20", "created": "a", "side": "buy", "price": 10.0, "shares": 100},
@@ -85,8 +85,9 @@ def t_position_math():
         ],
         13.0,
     )
-    assert p["held"] == 200 and abs(p["avg_cost"] - 11.0) < 1e-9, p
-    assert abs(p["unrealized"] - (13.0 - 11.0) * 200) < 1e-9, p
+    exp_avg = (2200.0 + (1000.0 + 1200.0) * (5e-4 + 1e-5)) / 200
+    assert p["held"] == 200 and abs(p["avg_cost"] - exp_avg) < 1e-4, p
+    assert abs(p["unrealized"] - (13.0 - exp_avg) * 200) < 1e-2, p
     # 卖出产生已实现盈亏（按卖出时点均价）
     p = pos_of(
         [
@@ -96,10 +97,41 @@ def t_position_math():
         ],
         13.0,
     )
-    assert p["held"] == 100 and p["avg_cost"] == 11.0, p
-    assert abs(p["realized"] - (14.0 - 11.0) * 100) < 1e-9, p
-    assert abs(p["unrealized"] - (13.0 - 11.0) * 100) < 1e-9, p
-    # 超卖不产生负持仓（按可卖数量计已实现）
+    exp_avg3 = (2200.0 + 2200.0 * (5e-4 + 1e-5)) / 200
+    fee_sell3 = 1400.0 * (5e-4 + 1e-5 + 5e-4)
+    assert p["held"] == 100 and abs(p["avg_cost"] - exp_avg3) < 1e-4, p
+    assert abs(p["realized"] - ((14.0 - exp_avg3) * 100 - fee_sell3)) < 0.01, p
+    assert abs(p["unrealized"] - (13.0 - exp_avg3) * 100) < 0.01, p
+    # 含费用：买费摊入均价、卖费扣已实现（2026-11-12 口径批复）
+    p = pos_of(
+        [
+            {"date": "2026-10-20", "created": "a", "side": "buy", "price": 10.0, "shares": 100, "fee": 10.0},
+            {"date": "2026-10-21", "created": "b", "side": "sell", "price": 14.0, "shares": 100, "fee": 20.0},
+        ],
+        None,
+    )
+    assert p["avg_cost"] is None, p  # 已清仓
+    assert abs(p["realized"] - ((14.0 - 10.1) * 100 - 20.0)) < 1e-9, p  # (14-10.1)*100-20=370
+    # 部分卖出：均价含买费、浮动盈亏按含费成本
+    p = pos_of(
+        [
+            {"date": "2026-10-20", "created": "a", "side": "buy", "price": 10.0, "shares": 100, "fee": 10.0},
+            {"date": "2026-10-21", "created": "b", "side": "sell", "price": 14.0, "shares": 40, "fee": 8.0},
+        ],
+        12.0,
+    )
+    assert abs(p["avg_cost"] - 10.1) < 1e-9, p  # (10*100+10)/100，卖出不摊改均价
+    assert abs(p["realized"] - ((14.0 - 10.1) * 40 - 8.0)) < 1e-9, p  # 148
+    assert abs(p["unrealized"] - (12.0 - 10.1) * 60) < 1e-9, p  # 114
+    # fee 缺失按默认费率估算（佣金万5+过户万0.1双边，卖出另加印花 0.05%——与前端同模型）
+    p = pos_of(
+        [{"date": "2026-10-20", "created": "a", "side": "buy", "price": 10.0, "shares": 100}],
+        11.0,
+    )
+    fee_b = 1000.0 * (5e-4 + 1e-5)  # 0.5001
+    assert abs(p["avg_cost"] - (1000.0 + fee_b) / 100) < 1e-9, p
+    assert abs(p["unrealized"] - (11.0 - (1000.0 + fee_b) / 100) * 100) < 1e-6, p
+    # 超卖：费用按整笔成交算（含超卖部分），已实现按可卖数量
     p = pos_of(
         [
             {"date": "2026-10-20", "created": "a", "side": "buy", "price": 10.0, "shares": 100},
@@ -107,9 +139,11 @@ def t_position_math():
         ],
         None,
     )
+    fee_s = 9.0 * 500 * (5e-4 + 1e-5 + 5e-4)
+    avg_b = 1000.0 * (1 + (5e-4 + 1e-5)) / 100  # 买费摊入
     assert p["held"] == 0 and p["avg_cost"] is None, p
-    assert abs(p["realized"] - (9.0 - 10.0) * 100) < 1e-9, p
-    # 乱序输入按日期排序
+    assert abs(p["realized"] - ((9.0 - avg_b) * 100 - fee_s)) < 0.01, p
+    # 乱序输入按日期排序（fee 缺失按默认费率估算：2200 元 → 1.1222，摊入均价）
     p = pos_of(
         [
             {"date": "2026-10-21", "created": "b", "side": "buy", "price": 12.0, "shares": 100},
@@ -117,7 +151,7 @@ def t_position_math():
         ],
         None,
     )
-    assert p["held"] == 200 and abs(p["avg_cost"] - 11.0) < 1e-9, p
+    assert p["held"] == 200 and abs(p["avg_cost"] - (2200.0 + 2200.0 * (5e-4 + 1e-5)) / 200) < 1e-4, p
 
 
 def t_store_roundtrip():
@@ -158,12 +192,14 @@ def t_store_roundtrip():
         assert len(store2.trades(None)) == 2
         assert store2.trades(None)[0]["note"] == "首仓"
         assert abs(store2.trades(None)[0]["price"] - 10.05) < 1e-9
-        # 持仓汇总（latest_price=10.4）
+        # 持仓汇总（latest_price=10.4；fee 缺失按默认费率估算）
         pos = store2.positions(None)
+        avg_c = (1005.0 + 1005.0 * (5e-4 + 1e-5)) / 100  # 买费摊入均价
+        fee_s = 550.0 * (5e-4 + 1e-5 + 5e-4)             # 卖费=佣金+过户+印花
         assert pos["600000.SH"]["held"] == 50
-        assert abs(pos["600000.SH"]["avg_cost"] - 10.05) < 1e-9
-        assert abs(pos["600000.SH"]["realized"] - (11.0 - 10.05) * 50) < 1e-6
-        assert abs(pos["600000.SH"]["unrealized"] - (10.4 - 10.05) * 50) < 1e-6
+        assert abs(pos["600000.SH"]["avg_cost"] - avg_c) < 1e-4
+        assert abs(pos["600000.SH"]["realized"] - ((11.0 - avg_c) * 50 - fee_s)) < 0.01
+        assert abs(pos["600000.SH"]["unrealized"] - (10.4 - avg_c) * 50) < 0.01
         # 删除
         ts, removed = store2.trade_remove(None, "600000.SH", r1["id"])
         assert removed and len(ts) == 1

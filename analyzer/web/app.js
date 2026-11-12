@@ -347,17 +347,19 @@ async function loadTradePositions() {
   } catch (_) { /* 持仓列可选，失败静默 */ }
 }
 
-/** 移动加权平均：持仓股数 / 均价 / 已实现盈亏 / 浮动盈亏（lastPrice 为最新真实价）。 */
+/** 移动加权平均（含费用）：持仓股数 / 均价 / 已实现盈亏 / 浮动盈亏（lastPrice 为最新真实价）。
+ *  买费摊入均价（浮动盈亏含买费）、卖费从已实现扣——与后端 position_of 同口径；费用另列。 */
 function computePosition(ts, lastPrice) {
   let held = 0, avg = 0, realized = 0;
   const list = [...(ts || [])].sort((a, b) =>
     (a.date + a.created < b.date + b.created) ? -1 : 1);
   for (const t of list) {
+    const fee = tradeFee(t);
     if (t.side === "buy") {
-      avg = (avg * held + t.price * t.shares) / (held + t.shares);
+      avg = (avg * held + t.price * t.shares + fee) / (held + t.shares);
       held += t.shares;
     } else {
-      realized += (t.price - avg) * Math.min(t.shares, held);
+      realized += (t.price - avg) * Math.min(t.shares, held) - fee;
       held = Math.max(0, held - t.shares);
     }
   }
@@ -1543,7 +1545,7 @@ function updateTradeSummary() {
       : "已清仓")
     + ` · 已实现 <b class="${pctCls(pos.realized)}">${fmtSignedNum(pos.realized)}</b>`
     + (pos.held ? ` · 浮动 <b class="${pctCls(pos.unrealized)}">${fmtSignedNum(pos.unrealized)}</b>` : "");
-  el.title = "按移动加权平均成本计算；浮动盈亏基于最新收盘价";
+  el.title = "按移动加权平均成本计算（含费用：买费摊入成本、卖费扣已实现）；浮动盈亏基于最新收盘价";
 }
 
 /* ---------- 交易记录页（CRUD） ---------- */
@@ -1825,7 +1827,7 @@ function statsThead(mode, gran) {
       + th(u + "买入", u + "买入笔数") + th(u + "卖出", u + "卖出笔数")
       + th("买入金额", "借方：买入成交额合计") + th("卖出金额", "贷方：卖出成交额合计")
       + th("费用", u + "费用合计（实际值或按费率估算）")
-      + th(u + "已实现盈亏", "卖出按移动加权成本核算的已实现盈亏合计（不含费用，与持仓汇总口径一致）")
+      + th(u + "已实现盈亏", "卖出按移动加权成本核算的已实现盈亏合计（含费用：卖费已扣，与持仓汇总口径一致）")
       + `<th>涉及股票</th>`;
   } else {
     const e = gran === "day" ? "" : "期末";
@@ -1833,14 +1835,14 @@ function statsThead(mode, gran) {
     $("#stats-float-table thead").innerHTML = `<th>期间</th>`
       + th(e + "持仓只数", "期末收盘仍有持仓的股票只数")
       + th(e + "持仓市值", "Σ 收盘价×持仓股数（真实价口径）")
-      + th(e + "持仓成本", "Σ 移动加权成本×持仓股数（不含费用，与持仓汇总口径一致）")
+      + th(e + "持仓成本", "Σ 移动加权成本×持仓股数（含费用，与持仓汇总口径一致）")
       + th(e + "浮动盈亏", "持仓市值 − 持仓成本")
       + th(u + "变动", u + "内浮动盈亏变动（含买卖带来的仓变化）")
       + th(u + "已实现", u + "内卖出已实现盈亏合计");
   }
 }
 
-/** 逐日收益：按股票移动加权成本核算，卖出日归集已实现盈亏（与持仓汇总口径一致，不含费用）。 */
+/** 逐日收益：按股票移动加权成本核算（含费用），卖出日归集已实现盈亏（与持仓汇总口径一致）。 */
 function computeDailyStats(trades) {
   const byCode = {};
   for (const t of trades) (byCode[t.code] = byCode[t.code] || []).push(t);
@@ -1851,16 +1853,17 @@ function computeDailyStats(trades) {
     let held = 0, avg = 0;
     for (const t of list) {
       const amt = t.price * t.shares;
+      const fee = tradeFee(t);
       const d = day(t.date);
-      d.fee += tradeFee(t);
+      d.fee += fee;
       d.codes[code] = (d.codes[code] || 0) + 1;
       if (t.side === "buy") {
-        avg = (avg * held + amt) / (held + t.shares);
+        avg = (avg * held + amt + fee) / (held + t.shares);
         held += t.shares;
         d.buyAmt += amt;
         d.nBuy++;
       } else {
-        d.realized += (t.price - avg) * Math.min(t.shares, held);
+        d.realized += (t.price - avg) * Math.min(t.shares, held) - fee;
         held = Math.max(0, held - t.shares);
         d.sellAmt += amt;
         d.nSell++;
@@ -1880,7 +1883,7 @@ async function renderTradesStats() {
   const gn = STATS_GRAN_NAME[gran] || "每日";
   statsThead("realized", gran);
   statsThead("floating", gran);
-  // 摘要：三个维度一把尺（已实现盈亏，不含费用）
+  // 摘要：三个维度一把尺（已实现盈亏，含费用）
   const sumRealized = (start) =>
     daily.reduce((s, d) => (!start || d.date >= start ? s + d.realized : s), 0);
   const sm = $("#stats-summary");
@@ -1891,7 +1894,7 @@ async function renderTradesStats() {
       sm.innerHTML = chip("本周", sumRealized(statsRangeStart("week")))
         + " · " + chip("本月", sumRealized(statsRangeStart("month")))
         + " · " + chip("本年", sumRealized(statsRangeStart("year")))
-        + "（已实现，不含费用）";
+        + "（已实现，含费用）";
     }
   }
 
@@ -1906,7 +1909,7 @@ async function renderTradesStats() {
       : gn + "浮动盈亏汇总（期末快照 · 当期变动含买卖带来的仓变化）")
     : (gran === "day"
       ? "每日收益（已实现盈亏按移动加权成本逐笔核算，归集到卖出日 · 买入日无已实现收益 · 点击股票跳转个股）"
-      : gn + "收益汇总（已实现盈亏 · 移动加权成本口径 · 不含费用 · 点击股票跳转个股）");
+      : gn + "收益汇总（已实现盈亏 · 移动加权成本口径 · 含费用 · 点击股票跳转个股）");
   const ct = $("#stats-chart-title");
   if (ct) ct.textContent = gn + "浮动盈亏走势（持仓市值 − 持仓成本，按各股日线后复权×真实价锚折算 · 停牌日沿用最近收盘）";
   if (floating) {

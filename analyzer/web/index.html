@@ -29,7 +29,6 @@
   <button class="tab" data-tab="simtrade">模拟交易</button>
   <button class="tab" data-tab="trades">交易记录</button>
   <button class="tab" data-tab="journal">交易日记</button>
-  <button class="tab" data-tab="agent">问股</button>
   <button class="tab" data-tab="inbox">站内信<span class="tab-badge" id="inbox-tab-badge" style="display:none">0</span></button>
 </nav>
 
@@ -483,6 +482,33 @@
         <div id="ai-report" class="ai-report"></div>
         <div class="hint" id="ai-context"></div>
       </div>
+
+      <!-- 问股对话（DSA 吸收·模块3，嵌入 AI 分析子标签） -->
+      <div class="chart-box" style="margin-top:14px">
+        <div class="chart-title">
+          问股 Agent（策略框架 × 你的持仓盈亏，多轮对话）
+        </div>
+        <div class="agent-wrap agent-embedded">
+          <div class="agent-head">
+            <span class="toolbar-label">策略框架</span>
+            <select id="agent-strategy" class="inbox-select" title="分析策略（DSA 吸收 15 个 + 全景推演）">
+              <option value="">默认纪律（不选策略）</option>
+            </select>
+            <button id="agent-new" class="mini-btn" title="清空上下文，开新会话">新会话</button>
+            <span class="hint" id="agent-status" style="margin:0"></span>
+          </div>
+          <div class="agent-messages" id="agent-messages"></div>
+          <div class="agent-input">
+            <input id="agent-input" type="text" placeholder="问股：300687 现在能买吗 / 推演 300687 全部框架 / 换成 600519 看看 / 我的持仓如何？"
+                   autocomplete="off" maxlength="2000">
+            <button id="agent-send" class="mini-btn">发送</button>
+          </div>
+          <div class="hint" style="margin:6px 0 0;flex:none">
+            数据全部来自本地（行情/K线/筹码/资金流/持仓）；AI 负责分析，工具取数，禁止编造。
+            单轮预算 90 秒 / 工具调用 ≤6 步。
+          </div>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -815,29 +841,7 @@
     </div>
   </section>
 
-  <!-- ===================== 问股 Agent ===================== -->
-  <section id="tab-agent" class="panel">
-    <div class="agent-wrap">
-      <div class="agent-head">
-        <span class="toolbar-label">策略框架</span>
-        <select id="agent-strategy" class="inbox-select" title="分析策略（DSA 吸收，15 个）">
-          <option value="">默认纪律（不选策略）</option>
-        </select>
-        <button id="agent-new" class="mini-btn" title="清空上下文，开新会话">新会话</button>
-        <span class="hint" id="agent-status" style="margin:0"></span>
-      </div>
-      <div class="agent-messages" id="agent-messages"></div>
-      <div class="agent-input">
-        <input id="agent-input" type="text" placeholder="问股：300687 现在能买吗 / 换成 600519 看看 / 对比两只 / 我的持仓如何？"
-               autocomplete="off" maxlength="2000">
-        <button id="agent-send" class="mini-btn">发送</button>
-      </div>
-      <div class="hint" style="margin:6px 0 0">
-        数据全部来自本地（行情/K线/筹码/资金流/持仓）；AI 负责分析，工具取数，禁止编造。
-        单轮预算 90 秒 / 工具调用 ≤6 步。
-      </div>
-    </div>
-  </section>
+  <!-- ===================== 站内信（消息中心） ===================== -->
 
   <section id="tab-inbox" class="panel">
     <div class="inbox-wrap">

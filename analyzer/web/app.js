@@ -4234,7 +4234,6 @@ function switchTab(name, opts = {}) {
   if (name === "stock") loadWatchlist();
   if (name === "trades") loadTradesPage();
   if (name === "journal") loadJournal(JOURNAL.code);
-  if (name === "agent") initAgentChat();
   if (name === "inbox") loadInbox();
   if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
 }
@@ -4263,6 +4262,7 @@ function switchSub(name) {
   (SUB_CHARTS[name] || []).forEach((id) => {
     if (charts[id]) charts[id].resize();
   });
+  if (name === "ai") initAgentChat();   // 问股 Agent 已并入 AI 分析子标签
 }
 
 function bindSubTabs() {

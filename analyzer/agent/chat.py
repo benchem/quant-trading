@@ -27,8 +27,9 @@ from .llm import AIConfig, AIError, chat_completion
 from . import tools as agent_tools
 
 MAX_STEPS = 6
-CHAT_TIMEOUT_S = 90.0          # 总预算（独立于报告用 AI_TIMEOUT）
-MIN_STEP_BUDGET_S = 10.0       # 剩余低于此值不再发起工具轮，要求直接作答
+CHAT_TIMEOUT_S = 150.0         # 总预算（GLM 思考模型每轮 30-40s，90s 跑不完多工具轮）
+MIN_STEP_BUDGET_S = 45.0       # 剩余低于此值不再发起工具轮，直接收口作答
+FINAL_ANSWER_TIMEOUT_S = 75.0  # 收口调用独立超时（不占循环预算，防止空回复）
 HISTORY_TAIL = 20              # 多轮历史截尾（DSA 降级策略同款）
 STRATEGIES_DIR = Path(__file__).resolve().parents[2] / "strategies"
 
@@ -38,7 +39,8 @@ CHAT_SYSTEM_PROMPT = """你是一位严谨的 A 股分析助手，服务单个�
 ## 工作流程（四阶段）
 1. **理解问题**：确认用户问的标的与关注点；模糊时先调用工具取数据再判断，不要凭空假设。
 2. **收集数据**：按需调用工具（行情/K线/技术面/筹码/基本面/资金流/板块/大盘/新闻/持仓）。
-   每轮最多调用必要的工具；数据已在历史消息中的不要重复取。
+   **一次回复里可以并行调用多个工具**（如同时取 analyze_trend + get_positions + get_daily_history），
+   能并行的不要拆成多轮——每轮 LLM 交互都有成本。数据已在历史消息中的不要重复取。
 3. **分析**：结合所选策略框架与数据给出结构化分析：趋势判断、关键价位、量价配合、风险点。
    **涉及用户持仓的标的时必须结合仓位**：先用 get_positions 取持仓（股数/成本/浮盈亏），
    与市场筹码平均成本对照（你的成本在全市场平均成本之上还是之下），再谈框架判定——
@@ -223,9 +225,31 @@ def run_chat_turn(store, user: str | None, session_id: str | None,
     steps = 0
     usage_total = 0
     reply = ""
+
+    def _final_answer() -> str:
+        """预算收口：基于已获取数据强制作答。
+
+        独立短超时（不占循环预算）——否则"预算耗尽"会连同最终回答一起被掐掉，
+        落下空 reply（2026-11-12 全景推演首测即撞此坑：90s 耗尽 → 空 answer 落盘）。
+        """
+        import dataclasses
+        messages.append({"role": "user", "content":
+                         "（系统提示：时间或步数预算已到，请立即基于以上已获取的全部数据"
+                         "给出最终回答，不要再调用工具。数据不足的部分如实说明即可。）"})
+        cfg = dataclasses.replace(config, timeout=FINAL_ANSWER_TIMEOUT_S)
+        r = chat_completion(cfg, messages)
+        return r["content"]
+
     while steps < MAX_STEPS:
         remaining = CHAT_TIMEOUT_S - (time.time() - t0)
         if remaining <= 0:
+            # 预算耗尽：已有工具数据则强制收口，不能静默落空回复
+            if steps > 0:
+                try:
+                    reply = _final_answer()
+                except AIError:
+                    reply = (f"（预算耗尽：已完成 {steps} 步工具取数，但未能生成结论——"
+                             "请再发一句\"基于已有数据给结论\"即可续答。）")
             break
         resp = chat_completion(config, messages, tools=agent_tools.TOOL_SPECS)
         usage_total += (resp.get("usage") or {}).get("total_tokens") or 0
@@ -233,13 +257,12 @@ def run_chat_turn(store, user: str | None, session_id: str | None,
         if not calls:
             reply = resp["content"]
             break
-        # 预算守卫：剩余不足以再跑一轮工具+回答 → 要求直接作答
+        # 预算守卫：剩余不足以再跑一轮工具+回答 → 直接收口
         if remaining < MIN_STEP_BUDGET_S:
-            messages.append({"role": "user", "content":
-                             "（系统提示：剩余时间不足，请立即基于已获取的数据给出最终回答，不要再调用工具）"})
-            resp = chat_completion(config, messages)  # 不带 tools
-            usage_total += (resp.get("usage") or {}).get("total_tokens") or 0
-            reply = resp["content"]
+            try:
+                reply = _final_answer()
+            except AIError as e:
+                reply = f"（收口失败：{e}）"
             break
         messages.append({"role": "assistant", "content": resp["content"] or "",
                          "tool_calls": [{"id": c["id"], "type": "function",
@@ -258,11 +281,10 @@ def run_chat_turn(store, user: str | None, session_id: str | None,
         steps += 1
     else:
         # max_steps 打满：强制收口（DSA runner.py:589-601 语义）
-        messages.append({"role": "user", "content":
-                         "（系统提示：已达到工具调用步数上限，请基于以上全部数据立即给出最终回答）"})
-        resp = chat_completion(config, messages)
-        usage_total += (resp.get("usage") or {}).get("total_tokens") or 0
-        reply = resp["content"]
+        try:
+            reply = _final_answer()
+        except AIError as e:
+            reply = f"（收口失败：{e}）"
 
     # 写回会话（assistant 失败也要落 user 侧，DSA [分析失败] 语义）
     now = dt.datetime.now().isoformat(timespec="seconds")

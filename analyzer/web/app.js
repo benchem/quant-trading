@@ -4895,7 +4895,7 @@ async function agentSend() {
   if (!msg) return;
   inp.value = "";
   agentRender({ role: "user", content: msg });
-  agentSetStatus("问股 Agent 分析中（本地工具取数 + AI 推理，最长 90 秒）…", true);
+  agentSetStatus("问股 Agent 分析中（本地工具取数 + AI 推理，最长 150 秒）…", true);
   const typing = $("#agent-messages");
   const think = document.createElement("div");
   think.className = "agent-msg agent-ai agent-thinking";

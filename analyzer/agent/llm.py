@@ -90,6 +90,9 @@ def chat_completion(config: AIConfig, messages: list[dict],
         data = resp.json()
         msg = data["choices"][0]["message"]
         content = (msg.get("content") or "").strip()
+        if not content:
+            # GLM/Z 系思考模型经 one-api 透传时正文可能落在 reasoning_content
+            content = (msg.get("reasoning_content") or "").strip()
         raw_calls = msg.get("tool_calls") or []
         tool_calls = [{"id": c.get("id") or f"call_{i}",
                        "name": (c.get("function") or {}).get("name") or "",

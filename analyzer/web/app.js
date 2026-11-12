@@ -4253,6 +4253,7 @@ const SUB_CHARTS = {
   cd: ["chart-cd-1", "chart-cd-2", "chart-cd-3", "chart-chips"],
   bb: ["chart-bb-1", "chart-bb-2", "chart-bb-3"],
   fund: ["chart-fund"],
+  flow: ["chart-flow"],
 };
 
 function switchSub(name) {

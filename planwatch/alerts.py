@@ -4,9 +4,29 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from .common import WATCHLOG, ensure_dir, now_cst
+from .common import ROOT, WATCHLOG, ensure_dir, now_cst
 
 FIRED = "alert_fired.json"
+
+
+def t2_frozen() -> tuple[bool, str]:
+    """T2 解锁判定（gates rev5 base_position_tiers）：kill 生效=L2 冻结；
+    修复未确认=L1 冻结；仅 L0_repaired（海外/国内修复各3日）解锁。返回 (是否冻结, 原因)。"""
+    try:
+        k = json.loads((ROOT / "monitoring" / "sleeve_kill.json").read_text("utf-8"))
+        if k.get("active"):
+            return True, "kill生效(L2)"
+    except Exception:
+        pass
+    try:
+        g = json.loads((ROOT / "data" / "monitor" / "gate_state.json").read_text("utf-8"))
+        ov = (g.get("overseas") or {}).get("repair_streak", 0)
+        dm = (g.get("domestic") or {}).get("repair_streak", 0)
+        if ov < 3 or dm < 3:
+            return True, f"L1修复未确认(海外{ov}/3,国内{dm}/3)"
+    except Exception:
+        pass
+    return False, ""
 
 
 @dataclass
@@ -63,10 +83,19 @@ def evaluate(q: dict, plan: dict, book: dict, allow_t: bool = True) -> list[Aler
              z[0] <= P <= z[1], cool=5)
     if "T2" in pending and tr_map.get("T2", {}).get("status") != "killed":
         z = L["t2_zone"]
-        emit("t2", "target",
-             f"🟢 T2 入场窗口 {z[0]}~{z[1]}（{tr_map['T2']['shares']} 股；v2 四条件缺一不可："
-             f"未破 {z[0]} + 全天成交额≤3.2 亿 + 收盘≥26.0 + 低点>23.34，收盘确认型，不抢跑）",
-             z[0] <= P <= z[1], cool=5)
+        fz, why = t2_frozen()
+        if fz:
+            # 2026-11-13：L1/L2 冻结日不再推 🟢 入场窗口（与姿态自相矛盾），
+            # 改推冻结说明——窗口提示≠买入许可
+            emit("t2", "info",
+                 f"⚪ T2 价区 {z[0]}~{z[1]} 触及，但 {why} → 冻结不买"
+                 f"（解锁=海外三腿+创业板修复各3日）；窗口提示≠买入许可",
+                 z[0] <= P <= z[1], cool=5)
+        else:
+            emit("t2", "target",
+                 f"🟢 T2 入场窗口 {z[0]}~{z[1]}（{tr_map['T2']['shares']} 股；v2 四条件缺一不可："
+                 f"未破 {z[0]} + 全天成交额≤3.2 亿 + 收盘≥26.0 + 低点>23.34，收盘确认型，不抢跑）",
+                 z[0] <= P <= z[1], cool=5)
     if "T3" in pending and tr_map.get("T3", {}).get("status") != "killed":
         emit("t3_watch", "info",
              f"T3 关注：已上 {L['t3_breakout']}，看量能+收盘确认（加 {tr_map['T3']['shares']} 股）",

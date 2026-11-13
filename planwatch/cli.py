@@ -8,7 +8,7 @@ import re
 import sys
 import time
 
-from .alerts import Alert, evaluate
+from .alerts import Alert, evaluate, t2_frozen
 from .common import WATCHLOG, ensure_dir, is_trading_day, now_cst, session
 from .notify import emit
 from .plan import audit, load as load_plan, save as save_plan, set_level, tail_audit
@@ -132,6 +132,13 @@ TIME_HOOKS = {
     "14:38": ("warn", "⏰ 距 14:40 还有 2 分钟：检查 T 是否未对冲，14:50 前必须全部了结"),
     "14:57": ("warn", "⏰ 收盘前 3 分钟：T2 四条件逐条核对（未破 25.50/额≤3.2亿/收≥26.0/低点>23.34）/ 未对冲 T 必须了结"),
 }
+
+# 2026-11-13：T2 冻结日（L1修复未确认/L2 kill）14:57 清单跳过四条件核对，避免与姿态矛盾
+try:
+    if t2_frozen()[0]:
+        TIME_HOOKS["14:57"] = ("warn", "⏰ 收盘前 3 分钟：未对冲 T 必须了结（T2 本日冻结，跳过四条件核对）")
+except Exception:
+    pass
 
 
 def _check_cond(cond: str, close: float) -> bool:
